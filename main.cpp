@@ -44,7 +44,7 @@ int main() {
     std::cout << "Number of devices: " << ndev << std::endl;
 
 
-    *void hdl = nullptr;
+    void* handle 
 
 
     dlclose(handle);
