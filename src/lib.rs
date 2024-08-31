@@ -8,7 +8,7 @@ use std::thread;
 
 use ibverbs_rs::receiver::Receiver;
 use ibverbs_rs::sender::Sender;
-use ibverbs_rs::{ControlBufferTrait, Hints, IbvAccessFlags, IbvMr, IbvRecvWr, IbvWcOpcode, IbvWrOpcode, LookUpBy, QpMode, SendRecv};
+use ibverbs_rs::{print_wr_ids, ControlBufferTrait, Hints, IbvAccessFlags, IbvMr, IbvRecvWr, IbvSendWr, IbvWcOpcode, IbvWrOpcode, LookUpBy, QpMode, SendRecv};
 use rdma_sys::*;
 use std::sync::Once;
 use env_logger::Env;
@@ -25,7 +25,7 @@ pub fn initialize_logger() {
     });
 }
 
-use libc::{c_int, size_t};
+use libc::{c_int, size_t, stat};
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct NcclNetSocketHandle {
@@ -45,8 +45,23 @@ pub struct RemoteHandle{
 }
 
 enum SenderReceiver{
-    Sender(Sender),
-    Receiver(Receiver),
+    Sender{
+        sender: Sender,
+        state: State,
+    },
+    Receiver{
+        receiver: Receiver,
+        state: State,
+    }
+}
+
+#[derive(Debug, Default)]
+struct State{
+    id: u32,
+    mrs: u32,
+    nreqs: u32,
+    completed: u32,
+    posted: u32,
 }
 
 extern "C" fn plugin_init(_log_function: ncclDebugLogger_t) -> ncclResult_t {
@@ -113,8 +128,9 @@ extern "C" fn plugin_listen(_dev: c_int, handle: *mut c_void, listen_comm: *mut 
             *handle = netsock_handler;
         }
     }
-
-    let listen_comm_handle = Box::into_raw(Box::new(SenderReceiver::Receiver(receiver)));
+    let mut state = State::default();
+    state.id = rand::random::<u32>();
+    let listen_comm_handle = Box::into_raw(Box::new(SenderReceiver::Receiver { receiver, state }));
     if !listen_comm.is_null() {
         unsafe {
             *listen_comm = listen_comm_handle as *mut c_void;
@@ -166,8 +182,12 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
         log::error!("Error connecting: {:?}", e);
         return 1;
     }
-
-    let sender_handle = Box::into_raw(Box::new(SenderReceiver::Sender(sender)));
+    let mut state = State::default();
+    state.id = rand::random::<u32>();
+    let sender_handle = Box::into_raw(Box::new(SenderReceiver::Sender{
+        sender,
+        state,
+    }));
 
     unsafe {
         *send_comm = sender_handle as *mut c_void;
@@ -176,7 +196,7 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
 }
 extern "C" fn plugin_accept(listen_comm: *mut c_void, recv_comm: *mut *mut c_void, _recv_dev_comm: *mut *mut ncclNetDeviceHandle_v8_t) -> ncclResult_t {
     let mut sender_receiver = unsafe { Box::from_raw(listen_comm as *mut SenderReceiver) };
-    if let SenderReceiver::Receiver(ref mut receiver) = *sender_receiver{
+    if let SenderReceiver::Receiver{ref mut receiver, state: _} = *sender_receiver{
         if let Err(e) = receiver.accept(){
             log::error!("Error accepting: {:?}", e);
             return 1;
@@ -196,11 +216,19 @@ extern "C" fn plugin_reg_mr(coll_comm: *mut c_void, data: *mut c_void, size: siz
     let access_flags = IbvAccessFlags::LocalWrite.as_i32() | IbvAccessFlags::RemoteWrite.as_i32() | IbvAccessFlags::RemoteRead.as_i32();
     let mut sender_receiver = unsafe { Box::from_raw(coll_comm as *mut SenderReceiver) };
     let mr = match *sender_receiver{
-        SenderReceiver::Sender(ref mut sender) => {
-            IbvMr::new(sender.pd.clone(), data, size, access_flags)
+        SenderReceiver::Sender{ref mut sender, ref mut state} => {
+            state.mrs += 1;
+            sender.incr_mrs();
+            let mr = IbvMr::new(sender.pd.clone(), data, size, access_flags);
+            mr
         },
-        SenderReceiver::Receiver(ref mut receiver) => {
-            IbvMr::new(receiver.pd.clone(), data, size, access_flags)
+        SenderReceiver::Receiver{ref mut receiver, ref mut state} => {
+            state.mrs += 1;
+            receiver.incr_mrs();
+            let data_addr = data as u64;
+            let mr = IbvMr::new(receiver.pd.clone(), data, size, access_flags);
+            println!("{} plugin_reg_mr id {} mr addr {}, data addr {}", get_hostname(), state.id, mr.addr(), data_addr);
+            mr
         }
     };
     let mr_handle = Box::into_raw(Box::new(mr));
@@ -216,93 +244,82 @@ extern "C" fn plugin_dereg_mr(_coll_comm: *mut c_void, _mhandle: *mut c_void) ->
 }
 
 extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_int, _tag: c_int, _mhandle: *mut c_void, _request: *mut *mut c_void) -> ncclResult_t { 
-    
+
     let mut sender_receiver = unsafe { Box::from_raw(send_comm as *mut SenderReceiver) };
-    let sender = if let SenderReceiver::Sender(ref mut sender) = *sender_receiver{
-        sender
+    let (sender, state) = if let SenderReceiver::Sender{ref mut sender, ref mut state} = *sender_receiver{
+        (sender, state)
     } else {
         log::error!("Error accepting: {:?}", "Not a sender");
         return 1;
     };
-    sender.inc_nreqs();
 
-    thread::sleep(std::time::Duration::from_millis(1000));
-    let in_control_buffer_mr = sender.in_buffer_mr();
     let read_wr = ibverbs_rs::IbvSendWr::new(
-        &in_control_buffer_mr,
+        &sender.in_buffer_mr(),
         sender.out_remote_buffer_addr(),
         sender.out_remote_buffer_rkey(),
         IbvWrOpcode::RdmaRead,
     );
-    //thread::sleep(std::time::Duration::from_millis(500));
-    println!("reading from remote addr {}", sender.out_remote_buffer_addr());
     if let Err(e) = sender.qp_list[0].ibv_post_send(read_wr.as_ptr()){
         log::error!("Error posting read: {:?}", e);
         return 1;
     }
-
-    thread::sleep(std::time::Duration::from_millis(500));
-
-    let mr_addr = sender.in_buffer_mr().addr();
-    let sender_in_local_addr = sender.in_local_buffer_addr();
-    let in_buffer_ptr = sender.in_buffer_ptr() as u64;
-
-    println!("In buffer ptr: {}, In local addr: {}, In remote addr: {}", in_buffer_ptr, sender_in_local_addr, mr_addr);
-
-    let in_nccl_metadata = NcclMetadata::from(in_control_buffer_mr);
-    println!("In metadata: {:?}", in_nccl_metadata);
-    thread::sleep(std::time::Duration::from_secs(5));
-
     /*
-    let out_mr_address = out_control_buffer_mr.addr();
-    let out_mr_metadata = out_mr_address as *const NcclMetadata;
-    let out_mr_meta: &NcclMetadata = unsafe { &*out_mr_metadata };
-
-
-    thread::sleep(std::time::Duration::from_millis(5000));
-
-    let mr_meta = loop{
-        let mr_address = in_control_buffer_mr.addr();
-        let mr_metadata = mr_address as *const NcclMetadata;
-        let mr_meta: &NcclMetadata = unsafe { &*mr_metadata };
-        if mr_meta.nreq == sender.nreqs(){
-            break mr_meta.clone();
+    if let Err(e) = sender.qp_list[0].complete(1, IbvWcOpcode::RdmaRead, SendRecv::Send){
+        log::error!("Error completing: {:?}", e);
+        return 1;
+    }
+    */
+    let (remote_addr, remote_rkey) = loop {
+        let in_nccl_metadata = NcclMetadata::from(sender.in_buffer_mr());
+        let remote_addr = in_nccl_metadata.requests[0].address;
+        let remote_rkey = in_nccl_metadata.requests[0].rkey;
+        if remote_addr != 0 && remote_rkey != 0 {
+            break (remote_addr, remote_rkey);
         }
-        thread::sleep(std::time::Duration::from_millis(500));
     };
-    
 
-
-
-    
-
-    
-    //let mr = unsafe { Box::from_raw(_mhandle as *mut IbvMr) };
     let mr = unsafe { Box::from_raw(_mhandle as *mut IbvMr) };
     let send_wr = ibverbs_rs::IbvSendWr::new(
         &mr,
-        mr_meta.address,
-        mr_meta.rkey,
+        remote_addr,
+        remote_rkey,
         IbvWrOpcode::RdmaWrite,
     );
-    
+
+
+    println!("{} plugin_isend id {} con_id {} mr addr {}, remote addr {}, nreq {}", get_hostname(), state.id, sender.connection_id(), mr.addr(), remote_addr, state.nreqs);
+    //thread::sleep(std::time::Duration::from_secs(5));
     if let Err(e) = sender.qp_list[0].ibv_post_send(send_wr.as_ptr()){
         log::error!("Error posting send: {:?}", e);
         return 1;
     }
+    /*
+    if let Err(e) = sender.qp_list[0].complete(1, IbvWcOpcode::RdmaWrite, SendRecv::Send){
+        log::error!("Error completing: {:?}", e);
+        return 1;
+    }
     */
-
-    
-
-    //thread::sleep(std::time::Duration::from_secs(5));
-    //Box::into_raw(mr);
+    /*
+    let notify_send_wr = IbvSendWr::new(&sender.out_buffer_mr(), sender.in_remote_buffer_addr(), sender.in_remote_buffer_rkey(), IbvWrOpcode::Send);
+    if let Err(e) = sender.qp_list[0].ibv_post_send(notify_send_wr.inner){
+        log::error!("Error posting recv: {:?}", e);
+        return 1;
+    }
+    */
+    if state.nreqs == state.mrs{
+        state.nreqs = 0;
+    } else {
+        state.nreqs += 1;
+    }
+    Box::into_raw(mr);
     Box::into_raw(sender_receiver);
     let request = Request{
         id: rand::random::<u32>(),
         size: _size as u64,
-        //done: true,
+        done: true,
         send_receive: 0,
-        //addresses: [mr_meta.address],
+        address: 0,
+        rkey: 0,
     };
     
     unsafe { * _request = Box::into_raw(Box::new(request)) as *mut c_void };
@@ -310,51 +327,159 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
 }
 extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_void, _sizes: *mut c_int, _tags: *mut c_int, mhandles: *mut *mut c_void, _request: *mut *mut c_void) -> ncclResult_t { 
     let mut sender_receiver = unsafe { Box::from_raw(recv_comm as *mut SenderReceiver) };
-    let receiver = if let SenderReceiver::Receiver(ref mut receiver) = *sender_receiver{
-        receiver
+    let (receiver, state) = if let SenderReceiver::Receiver{ref mut receiver, ref mut state} = *sender_receiver{
+        (receiver, state)
     } else {
         log::error!("Error accepting: {:?}", "Not a receiver");
         return 1;
     };
-    receiver.inc_nreqs();
+    //println!("{} plugin_irecv state {:#?}, {}", get_hostname(), state, receiver.mrs());
+    //thread::sleep(std::time::Duration::from_millis(1000));
+
+    /*
+    if state.nreqs == state.mrs{
+        match receiver.qp_list[0].complete(0, IbvWcOpcode::RecvRdmaWithImm, SendRecv::Recv){
+            Ok(completed) => {
+                state.completed += completed as u32;
+            },
+            Err(e) => {
+                log::error!("Error completing: {:?}", e);
+                return 1;
+            }
+        }
+        if state.completed == state.posted{
+            *state = State::default();
+            let request = Request{
+                id: rand::random::<u32>(),
+                size: 0,
+                done: true,
+                send_receive: 0,
+                address: 0,
+                rkey: 0,
+            };
+            unsafe { * _request = Box::into_raw(Box::new(request)) as *mut c_void };
+        }
+    } else {
+        let mut size = 0;
+        let mut address_list = Vec::new();
+        for i in 0..n {
+            let s = unsafe { * _sizes.offset(i as isize) };
+            size += s;
+            let mhandle = unsafe { *mhandles.offset(i as isize) };
+            let mr = unsafe { Box::from_raw(mhandle as *mut IbvMr) };
+            let out_nccl_metadata = receiver.out_buffer_ptr() as *mut NcclMetadata;
+            let out_nccl_metadata: &mut NcclMetadata = unsafe { &mut *out_nccl_metadata };
+            let request = Request{
+                id: rand::random::<u32>(),
+                size: mr.length() as u64,
+                done: true,
+                send_receive: 1,
+                address: mr.addr(),
+                rkey: mr.rkey(),
+            };
+            out_nccl_metadata.address = mr.addr();
+            out_nccl_metadata.rkey = mr.rkey();
+            out_nccl_metadata.length = mr.length() as u64;
+            out_nccl_metadata.nreq = receiver.nreqs();
+            out_nccl_metadata.requests[receiver.nreqs() as usize] = request;
+            address_list.push(mr.addr());
+
+            //let notify_wr = IbvRecvWr::new(&receiver.in_buffer_mr());
+            //if let Err(e) = receiver.qp_list[0].ibv_post_recv(notify_wr){
+            //    log::error!("Error posting recv: {:?}", e);
+            //    return 1;
+            //}
+
+            Box::into_raw(mr);
+        }
+
+        if {state.nreqs += 1; state.nreqs} == state.mrs {
+            println!("{} plugin_irecv  state {:#?}", get_hostname(), state);
+            thread::sleep(std::time::Duration::from_secs(5));
+        };
+
+        let request = Request{
+            id: rand::random::<u32>(),
+            size: size as u64,
+            done: if {state.nreqs += 1; state.nreqs} == state.mrs {true} else {false},
+            send_receive: 0,
+            address: 0,
+            rkey: 0,
+        };
+    
+        unsafe { * _request = Box::into_raw(Box::new(request)) as *mut c_void };
+        state.nreqs += 1;
+        state.posted += 1;
+    }
+    */
+
     let mut size = 0;
     let mut address_list = Vec::new();
+    let mut _last_req = false;
     for i in 0..n {
-        let s = unsafe { * _sizes.offset(i as isize) };
+        let idx = i as isize;
+        let s = unsafe { * _sizes.offset(idx) };
         size += s;
-        let mhandle = unsafe { *mhandles.offset(i as isize) };
+        let mhandle = unsafe { *mhandles.offset(idx) };
         let mr = unsafe { Box::from_raw(mhandle as *mut IbvMr) };
-        println!("chaning metadata at addr {}", receiver.out_buffer_mr().addr());
-        let out_buffer_ptr = receiver.out_buffer_ptr() as u64;
         let out_nccl_metadata = receiver.out_buffer_ptr() as *mut NcclMetadata;
         let out_nccl_metadata: &mut NcclMetadata = unsafe { &mut *out_nccl_metadata };
-        println!("Out buffer ptr: {}", out_buffer_ptr);
-        //let mut out_nccl_metadata = NcclMetadata::from(receiver.out_buffer_mr());
+        let request = Request{
+            id: rand::random::<u32>(),
+            size: mr.length() as u64,
+            done: true,
+            send_receive: 1,
+            address: mr.addr(),
+            rkey: mr.rkey(),
+        };
+        println!("{} plugin_irecv id {} con_id {} address {} req {}", get_hostname(), state.id, receiver.connection_id(), mr.addr(), state.nreqs);
         out_nccl_metadata.address = mr.addr();
         out_nccl_metadata.rkey = mr.rkey();
         out_nccl_metadata.length = mr.length() as u64;
-        out_nccl_metadata.nreq = receiver.nreqs();
-        out_nccl_metadata.requests[0] = Request::default();
-        out_nccl_metadata.requests[1] = Request::default();
-        out_nccl_metadata.requests[2] = Request::default();
-        out_nccl_metadata.requests[3] = Request::default();
-        out_nccl_metadata.requests[4] = Request::default();
-        out_nccl_metadata.requests[5] = Request::default();
-        out_nccl_metadata.requests[6] = Request::default();
-        out_nccl_metadata.requests[7] = Request::default();
+        out_nccl_metadata.nreq = state.nreqs as u64;
+        out_nccl_metadata.requests[state.nreqs as usize] = request;
         address_list.push(mr.addr());
+
+        //let notify_wr = IbvRecvWr::new(&receiver.in_buffer_mr());
+        //if let Err(e) = receiver.qp_list[0].ibv_post_recv(notify_wr){
+        //    log::error!("Error posting recv: {:?}", e);
+        //    return 1;
+        //}
+        let last_req = if state.nreqs == state.mrs{
+            //println!("{} plugin_irecv state {:#?}", get_hostname(), state);
+            //println!("{} plugin_irecv Out metadata {:#?}", get_hostname(), out_nccl_metadata);
+            //thread::sleep(std::time::Duration::from_secs(5));
+            true
+        } else {
+            false
+        };
+        _last_req = last_req;
+
         Box::into_raw(mr);
-        
     }
+
+
+
+
+
+
     let request = Request{
         id: rand::random::<u32>(),
         size: size as u64,
-        //done: true,
-        send_receive: 1,
-        //addresses: address_list,
+        done: true,
+        send_receive: 0,
+        address: 0,
+        rkey: 0,
     };
 
     unsafe { * _request = Box::into_raw(Box::new(request)) as *mut c_void };
+    if state.nreqs == state.mrs{
+        state.nreqs = 0;
+    } else {
+        state.nreqs += 1;
+    }
+    state.posted += 1;
+
     Box::into_raw(sender_receiver);
     0
 }
@@ -363,7 +488,9 @@ extern "C" fn plugin_iflush(_recv_comm: *mut c_void, _n: c_int, _data: *mut *mut
 }
 extern "C" fn plugin_test(_request: *mut c_void, _done: *mut c_int, _size: *mut c_int) -> ncclResult_t {
     let req = unsafe { Box::from_raw(_request as *mut Request) };
-    unsafe { _done.write(1) } ;
+    if req.done{
+        unsafe { _done.write(1) } ;
+    }
     0
 }
 extern "C" fn plugin_close_send(_send_comm: *mut c_void) -> ncclResult_t { 
@@ -486,9 +613,10 @@ impl Display for CustomError{
 pub struct Request{
     id: u32,
     size: u64,
-    //done: bool,
+    done: bool,
     send_receive: u8,
-    //addresses: [u64; 8],
+    address: u64,
+    rkey: u32,
 }
 
 impl Request{
