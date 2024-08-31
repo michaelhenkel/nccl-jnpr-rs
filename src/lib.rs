@@ -213,6 +213,7 @@ extern "C" fn plugin_accept(listen_comm: *mut c_void, recv_comm: *mut *mut c_voi
     0
 }
 extern "C" fn plugin_reg_mr(coll_comm: *mut c_void, data: *mut c_void, size: size_t, _type_: c_int, mhandle: *mut *mut c_void) -> ncclResult_t {
+    let data_addr = data as u64;
     let access_flags = IbvAccessFlags::LocalWrite.as_i32() | IbvAccessFlags::RemoteWrite.as_i32() | IbvAccessFlags::RemoteRead.as_i32();
     let mut sender_receiver = unsafe { Box::from_raw(coll_comm as *mut SenderReceiver) };
     let mr = match *sender_receiver{
@@ -220,17 +221,18 @@ extern "C" fn plugin_reg_mr(coll_comm: *mut c_void, data: *mut c_void, size: siz
             state.mrs += 1;
             sender.incr_mrs();
             let mr = IbvMr::new(sender.pd.clone(), data, size, access_flags);
+            println!("{} plugin_reg_mr sender id {} mr addr {}, data addr {}", get_hostname(), state.id, mr.addr(), data_addr);
             mr
         },
         SenderReceiver::Receiver{ref mut receiver, ref mut state} => {
             state.mrs += 1;
             receiver.incr_mrs();
-            let data_addr = data as u64;
             let mr = IbvMr::new(receiver.pd.clone(), data, size, access_flags);
-            println!("{} plugin_reg_mr id {} mr addr {}, data addr {}", get_hostname(), state.id, mr.addr(), data_addr);
+            println!("{} plugin_reg_mr recv id {} mr addr {}, data addr {}", get_hostname(), state.id, mr.addr(), data_addr);
             mr
         }
     };
+    thread::sleep(std::time::Duration::from_secs(1));
     let mr_handle = Box::into_raw(Box::new(mr));
     unsafe { *mhandle = mr_handle as *mut c_void; }
     Box::into_raw(sender_receiver); 
