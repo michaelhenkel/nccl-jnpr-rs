@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::{c_void, CStr};
 use std::fmt::Display;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -12,7 +13,7 @@ use ibverbs_rs::receiver::Receiver;
 use ibverbs_rs::sender::Sender;
 use ibverbs_rs::{print_wr_ids, ControlBufferTrait, Hints, IbvAccessFlags, IbvMr, IbvQp, IbvRecvWr, IbvSendWr, IbvWcOpcode, IbvWrOpcode, LookUpBy, QpMode, SendRecv, SLOT_COUNT};
 use rdma_sys::*;
-use std::sync::Once;
+use std::sync::{Arc, Mutex, Once};
 use env_logger::Env;
 mod bindings;
 use bindings::*;
@@ -27,7 +28,7 @@ pub fn initialize_logger() {
     });
 }
 
-use libc::{c_int, size_t, stat};
+use libc::{c_int, size_t, stat, PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP};
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct NcclNetSocketHandle {
@@ -49,51 +50,118 @@ pub struct RemoteHandle{
 #[derive(Debug)]
 struct State{
     id: u32,
-    mrs: u32,
-    nreqs: u32,
-    completed: u32,
+    connection_id: u32,
+    nccl_md_tail: u32,
+    recv_send: SendRecv,
+    requests: HashMap<u32, Vec<u64>>,
     request_id: u32,
     sub_request_id: u32,
-    posted: u32,
-    requests: [Box<Request>; 128],
-    req_idx: usize,
-    total_size: u64,
-    transferred: u64,
-    remaining: u64,
-    slots: u32,
-    slots_retrieved: bool,
-    current_slot: u32,
-    remaining_slots: u32,
+    completions: u32,
+    cts_qp: Option<IbvQp>,
 }
+
+struct StateWrapper(Arc<Mutex<State>>);
+
+impl Debug for StateWrapper{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let locked_state = self.0.lock().unwrap();
+        write!(f, "{:?}", locked_state)
+    }
+}
+
+impl StateWrapper{
+    fn new(state: State) -> Self {
+        StateWrapper(Arc::new(Mutex::new(state)))
+    }
+    fn id(&self) -> u32 {
+        let locked_state = self.0.lock().unwrap();
+        locked_state.id
+    }
+    fn completions(&self) -> u32 {
+        let locked_state = self.0.lock().unwrap();
+        locked_state.completions
+    }
+    fn insert_request(&self, request_id: u32, local_address: u64){
+        let mut locked_state = self.0.lock().unwrap();
+        let requests = locked_state.requests.entry(request_id).or_insert(Vec::new());
+        requests.push(local_address);
+    }
+    fn connection_id(&self) -> u32 {
+        let locked_state = self.0.lock().unwrap();
+        locked_state.connection_id
+    }
+    fn nccl_md_tail(&self) -> u32 {
+        let locked_state = self.0.lock().unwrap();
+        locked_state.nccl_md_tail
+    }
+    fn recv_send(&self) -> SendRecv {
+        let locked_state = self.0.lock().unwrap();
+        locked_state.recv_send.clone()
+    }
+    fn request_id(&self) -> u32 {
+        let locked_state = self.0.lock().unwrap();
+        locked_state.request_id
+    }
+    fn sub_request_id(&self) -> u32 {
+        let locked_state = self.0.lock().unwrap();
+        locked_state.sub_request_id
+    }
+    fn set_ncc_md_tail(&self, nccl_md_tail: u32){
+        let mut locked_state = self.0.lock().unwrap();
+        locked_state.nccl_md_tail = nccl_md_tail;
+    }
+    fn set_request_id(&self, request_id: u32){
+        let mut locked_state = self.0.lock().unwrap();
+        locked_state.request_id = request_id;
+    }
+    fn set_sub_request_id(&self, sub_request_id: u32){
+        let mut locked_state = self.0.lock().unwrap();
+        locked_state.sub_request_id = sub_request_id;
+    }
+    fn inc_nccl_md_tail(&self, v: u32, max: u32) {
+        let mut locked_state = self.0.lock().unwrap();
+        locked_state.nccl_md_tail = (locked_state.nccl_md_tail + v) % max;
+    }
+    fn inc_completions(&self, inc: u32){
+        let mut locked_state = self.0.lock().unwrap();
+        locked_state.completions += inc;
+    }
+    fn dec_completions(&self, dec: u32){
+        let mut locked_state = self.0.lock().unwrap();
+        locked_state.completions -= dec;
+    }
+    fn dec_nccl_md_tail(&self, v: u32, max: u32) {
+        let mut locked_state = self.0.lock().unwrap();
+        locked_state.nccl_md_tail = (locked_state.nccl_md_tail - v) % max;
+    }
+    fn set_cts_qp(&self, qp: IbvQp){
+        let mut locked_state = self.0.lock().unwrap();
+        locked_state.cts_qp = Some(qp);
+    }
+    fn cts_qp(&self) -> IbvQp{
+        let locked_state = self.0.lock().unwrap();
+        locked_state.cts_qp.clone().unwrap()
+    }
+    fn print(&self){
+        let locked_state = self.0.lock().unwrap();
+        println!("{:?}", locked_state);
+    }
+}
+
+const NCCL_METADATA_SLOTS: usize = 255;
 
 impl Default for State{
     fn default() -> Self {
-        let mut requests_vec: Vec<Box<Request>> = Vec::with_capacity(128);
-        for _ in 0..128 {
-            requests_vec.push(Box::new(Request::default()));
-        }
-        let requests: [Box<Request>; 128] = requests_vec.try_into().unwrap();
-        for i in 0..128{
-            let mut request = Request::default();
-            request.id = i as u32;
-        }
         State{
             id: 0,
-            mrs: 0,
-            nreqs: 0,
+            connection_id: 0,
+            nccl_md_tail: 0,
+            recv_send: SendRecv::Send,
             request_id: 0,
             sub_request_id: 0,
-            completed: 0,
-            posted: 0,
-            requests,
-            req_idx: 0,
-            total_size: 0,
-            transferred: 0,
-            remaining: 0,
-            slots: 0,
-            slots_retrieved: false,
-            current_slot: 0,
-            remaining_slots: 0,
+            completions: 0,
+            requests: HashMap::new(),
+            cts_qp: None,
         }
     }
 }
@@ -164,7 +232,9 @@ extern "C" fn plugin_listen(_dev: c_int, handle: *mut c_void, listen_comm: *mut 
     }
     let mut state = State::default();
     state.id = rand::random::<u32>();
-    let listen_comm_handle = Box::into_raw(Box::new(SenderReceiver::Receiver { receiver, state }));
+    state.connection_id = receiver.connection_id();
+    state.recv_send = SendRecv::Recv;
+    let listen_comm_handle = Box::into_raw(Box::new(SenderReceiver::Receiver { receiver, state: StateWrapper::new(state) }));
     if !listen_comm.is_null() {
         unsafe {
             *listen_comm = listen_comm_handle as *mut c_void;
@@ -230,9 +300,11 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
     }
     let mut state = State::default();
     state.id = rand::random::<u32>();
+    state.connection_id = sender.connection_id();
+    state.recv_send = SendRecv::Send;
     let sender_handle = Box::into_raw(Box::new(SenderReceiver::Sender{
         sender,
-        state,
+        state: StateWrapper::new(state),
     }));
 
     unsafe {
@@ -263,19 +335,15 @@ extern "C" fn plugin_reg_mr(coll_comm: *mut c_void, data: *mut c_void, size: siz
     let mut sender_receiver = unsafe { Box::from_raw(coll_comm as *mut SenderReceiver) };
     let (pd, _sender_recv, _state) = match *sender_receiver{
         SenderReceiver::Sender{ref mut sender, ref mut state} => {
-            state.mrs += 1;
-            sender.incr_mrs();
             (sender.pd.clone(), "sender".to_string(), state)
 
         },
         SenderReceiver::Receiver{ref mut receiver, ref mut state} => {
-            state.mrs += 1;
-            receiver.incr_mrs();
             (receiver.pd.clone(), "recv".to_string(), state)
         }
     };
     let mr = IbvMr::new(pd, data, size, access_flags);
-    println!("{} plugin_reg_mr {}, state_id {}, mr addr {}, size {},", get_hostname(),_sender_recv, _state.id, mr.addr(), size);
+    println!("{} plugin_reg_mr {}, state_id {}, mr addr {}, size {},", get_hostname(),_sender_recv, _state.id(), mr.addr(), size);
     let mr_handle = Box::into_raw(Box::new(mr));
     unsafe { *mhandle = mr_handle as *mut c_void; }
     Box::into_raw(sender_receiver); 
@@ -298,151 +366,45 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
         log::error!("Error accepting: {:?}", "Not a sender");
         return 1;
     };
-    let mr = unsafe { Box::from_raw(_mhandle as *mut IbvMr) };
-    let slots = mr.length() / _size as usize;
-    let remainder = mr.length() % _size as usize;
-    let slots: usize = if remainder > 0 { slots + 1 } else { slots };
-    state.slots = slots as u32;
+    let nccl_md_tail = state.nccl_md_tail();
 
+    let start_position = nccl_md_tail % MAX_REQUESTS;
 
-    let request_idx = state.req_idx;
-    let mut request = state.requests[request_idx].clone();
-    
-
-
-    let magix: u32 = rand::random();
-
-    let current_slot = state.current_slot;
-
-    let slot_addr = sender.in_buffer_mr().addr() + current_slot as u64 * NcclMetadata::LEN as u64;
-    let nccl_metadata = slot_addr as *mut NcclMetadata;
-    let nccl_metadata: &mut NcclMetadata = unsafe { &mut *nccl_metadata };
-    while nccl_metadata.address == 0 || nccl_metadata.rkey == 0 || nccl_metadata.length == 0 {
-        unsafe { *_request = null_mut() };
-        Box::into_raw(mr);
-        Box::into_raw(sender_receiver);
-        return 0;
-        //thread::sleep(std::time::Duration::from_secs(1));
-    }
-    println!("{} isend con_id {} slot {} magix {} addr {} rkey {} lkey {} length {} nreq {} sub_req_id {} req_id {}",
-        get_hostname(),
-        sender.connection_id(),
-        current_slot,
-        magix,
-        nccl_metadata.address,
-        nccl_metadata.rkey,
-        nccl_metadata.lkey,
-        nccl_metadata.length,
-        nccl_metadata.nreq,
-        nccl_metadata.request.id,
-        nccl_metadata.request.request_id
-    );  
-    
-
-
-    let remote_addr = nccl_metadata.request.address;
-    let remote_rkey = nccl_metadata.request.rkey;
-    request.id = magix;
-    request.request_id = nccl_metadata.request.request_id;
-    request.size = _size as u64;
-    request.sizes[0] = _size;
-    request.n = 1;
-    request.done = true;
-    request.slot = current_slot;
-    request.total_slots = state.slots;
-    request.sender_receiver = RequestSenderReceiver::Sender;
-    request.address = remote_addr;
-    request.connection_id = sender.connection_id();
-    request.state_id = state.id;
-    request.nreq = state.nreqs;
-    request.qp = Some(sender.qp_list[0].clone());
-
-    state.total_size = mr.length() as u64;
-
-    let signaled = if state.slots == state.current_slot + 1 { 
-        true 
-    } else { 
-        false
-    };
-
-    request.complete = signaled;
+    let in_nccl_metadata_list = sender.in_buffer_ptr() as *mut NcclMetadataList;
+    let in_nccl_metadata_list: &mut NcclMetadataList = unsafe { &mut *in_nccl_metadata_list };
+    let in_nccl_metadata = in_nccl_metadata_list.0.get_mut(start_position as usize).unwrap();
+    let mhandle_mr = unsafe { Box::from_raw(_mhandle as *mut IbvMr) };
 
     let send_wr = ibverbs_rs::IbvSendWr::new(
-        mr.addr(),
-        mr.lkey(),
-        remote_addr,
-        remote_rkey,
+        _data as u64,
+        mhandle_mr.lkey(),
+        in_nccl_metadata.address,
+        in_nccl_metadata.rkey,
         _size as u64,
-        state.transferred,
+        0,
         IbvWrOpcode::RdmaWrite,
-        signaled,
+        true,
+        None,
     );
-
-    /*
-    println!("{} isend con_id {} l_addr {} offset {} r_addr {} tot {} tx {} rem {} req {} tx_size {} mr_size {}",
-        get_hostname(),
-        sender.connection_id(),
-        mr.addr(),
-        state.transferred,
-        remote_addr,
-        state.total_size,
-        state.transferred,
-        state.remaining,
-        state.nreqs,
-        _size,
-        mr.length()
-    );
-    */
-    
-    
-    //thread::sleep(std::time::Duration::from_millis(100));
-
 
     if let Err(e) = sender.qp_list[0].ibv_post_send(send_wr.as_ptr()){
         println!("{} plugin_isend post error {:#?}", get_hostname(), e);
         log::error!("Error posting send: {:?}", e);
         return 1;
     }
-    
+    state.inc_nccl_md_tail(1, MAX_REQUESTS);
 
-    nccl_metadata.address = 0;
-    nccl_metadata.rkey = 0;
-    nccl_metadata.length = 0;
+    let arc_ptr = Arc::as_ptr(&state.0) as *mut State;
+    let state_void_ptr = arc_ptr as *mut c_void;
+    unsafe { * _request = state_void_ptr };
 
-    state.current_slot += 1;
-    state.remaining_slots = state.slots - state.current_slot;
-    state.transferred += _size as u64;
-    state.remaining = state.total_size - state.transferred;
-    
-    if state.remaining == 0{
-        for i in 0..state.nreqs{
-            let mut request = Request::default();
-            request.id = i as u32;
-            state.requests[i as usize] = Box::new(request);
-        }
-        state.total_size = 0;
-        state.transferred = 0;
-        state.remaining = 0;
-        state.nreqs = 0;
-        state.req_idx = 0;
-        state.slots = 0;
-        state.current_slot = 0;
-        state.remaining_slots = 0;
-        state.slots_retrieved = false;
-    } else {
-        state.nreqs += 1;
-        state.req_idx += 1;
-    }
-
-    if request.qp.is_none(){
-        panic!("{} isend id {} con_id {} request {:?} qp is none", get_hostname(), state.id, sender.connection_id(), request);
-    }
-    
-    Box::into_raw(mr);
+    Box::into_raw(mhandle_mr);
     Box::into_raw(sender_receiver);
-    unsafe { * _request = Box::into_raw(request) as *mut c_void };
     0
 }
+
+const MAX_REQUESTS: u32 = 255;
+
 extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_void, _sizes: *mut c_int, _tags: *mut c_int, mhandles: *mut *mut c_void, _request: *mut *mut c_void) -> ncclResult_t { 
     let mut sender_receiver = unsafe { Box::from_raw(recv_comm as *mut SenderReceiver) };
     let (receiver, state) = if let SenderReceiver::Receiver{ref mut receiver, ref mut state} = *sender_receiver{
@@ -451,7 +413,64 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
         log::error!("Error accepting: {:?}", "Not a receiver");
         return 1;
     };
-    let magix: u32 = rand::random();
+
+    let nccl_md_tail = state.nccl_md_tail();
+    state.set_sub_request_id(rand::random::<u32>());
+
+    let start_position = nccl_md_tail % MAX_REQUESTS;
+
+    let out_nccl_metadata_list = receiver.out_buffer_ptr() as *mut NcclMetadataList;
+    let out_nccl_metadata_list: &mut NcclMetadataList = unsafe { &mut *out_nccl_metadata_list };
+
+
+    for idx in 0..n {
+        let position = (start_position + idx as u32) % MAX_REQUESTS;
+        let size = unsafe { * _sizes.offset(idx as isize) };
+        let mhandle = unsafe { *mhandles.offset(idx as isize) };
+        let mhandle_mr = unsafe { Box::from_raw(mhandle as *mut IbvMr) };
+        let data = unsafe { * _data.offset(idx as isize) };
+
+        println!("{} plugin_irecv data addr {}",
+            get_hostname(),
+            data as u64
+        );
+
+        if data as u64 == mhandle_mr.addr() {
+            state.set_request_id(rand::random::<u32>());
+        }
+
+        state.insert_request(state.request_id(), data as u64);
+
+        let out_nccl_metadata = out_nccl_metadata_list.0.get_mut(position as usize).unwrap();
+        out_nccl_metadata.address = _data as u64;
+        out_nccl_metadata.rkey = mhandle_mr.rkey();
+        out_nccl_metadata.length = size as u64;
+        out_nccl_metadata.nreqs = n as u64;
+        out_nccl_metadata.idx = state.nccl_md_tail() as u64 + 1;
+        Box::into_raw(mhandle_mr);
+    }
+
+    let send_wr = ibverbs_rs::IbvSendWr::new(
+        receiver.out_buffer_mr().addr(),
+        receiver.out_buffer_mr().lkey(),
+        receiver.in_remote_buffer_addr(),
+        receiver.in_remote_buffer_rkey(),
+        NcclMetadata::LEN as u64 * n as u64,
+        NcclMetadata::LEN as u64 * state.nccl_md_tail() as u64,
+        IbvWrOpcode::RdmaWrite,
+        true,
+        None,
+    );
+
+    state.inc_completions(1);
+
+    if let Err(e) = receiver.qp_list[0].ibv_post_send(send_wr.as_ptr()){
+        println!("{} plugin_irecv post error {:#?}", get_hostname(), e);
+        log::error!("Error posting send: {:?}", e);
+        return 1;
+    }
+    state.set_cts_qp(receiver.qp_list[0].clone());
+    state.inc_nccl_md_tail(n as u32, MAX_REQUESTS);
 
     /*
     let recv_wr = IbvRecvWr::new(None, Some(magix as u64));
@@ -460,219 +479,41 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
         return 1;
     }
     */
-    if state.request_id == 0{
-        state.request_id = rand::random::<u32>();
-    }
-
-
-    let request_idx = state.req_idx;
-    let mut request = state.requests[request_idx].clone();
-    let mut address_list = Vec::new();
-    for i in 0..n {
-        let idx = i as isize;
-        let s = unsafe { * _sizes.offset(idx) };
-        let mhandle = unsafe { *mhandles.offset(idx) };
-        let mr = unsafe { Box::from_raw(mhandle as *mut IbvMr) };
-
-        let slots = mr.length() / s as usize;
-        let remainder = mr.length() % s as usize;
-        let slots: usize = if remainder > 0 { slots + 1 } else { slots };
-        state.slots = slots as u32;
-
-        let out_nccl_metadata_list = receiver.out_buffer_ptr() as *mut NcclMetadataList;
-        let out_nccl_metadata_list: &mut NcclMetadataList = unsafe { &mut *out_nccl_metadata_list };
-
-        state.total_size = mr.length() as u64;
 
 
 
-        let offset = state.transferred;
-        request.id = magix;
-        request.size = s as u64;
-        request.sizes[i as usize] = s;
-        request.n = n as u32;
-        request.done = true;
-        request.sender_receiver = RequestSenderReceiver::Receiver;
-        request.address = mr.addr();
-        request.offset = offset;
-        request.offset_address = mr.addr() + offset;
-        request.rkey = mr.rkey();
-        request.state_id = state.id;
-        request.connection_id = receiver.connection_id();
-        request.nreq = state.nreqs;
-        request.qp = Some(receiver.qp_list[0].clone());
-        request.magix = magix;
-        request.slot = state.current_slot;
-        request.total_slots = state.slots;
-        request.md_local_address = receiver.out_buffer_mr().addr();
-        request.md_remote_address = receiver.in_remote_buffer_addr();
-        request.md_offset = NcclMetadata::LEN as u64 * state.current_slot as u64;
-        request.md_lkey = receiver.out_buffer_mr().lkey();
-        request.md_rkey = receiver.in_remote_buffer_rkey();
-        request.md_length = NcclMetadata::LEN as u64;
-        request.md_local_offset_addr = receiver.out_buffer_mr().addr() + request.md_offset;
-        request.md_remote_offset_addr = receiver.in_remote_buffer_addr() + request.md_offset;
-        request.request_id = state.request_id;
-        //let mr_size = mr.length();
-        //println!("{} plugin_irecv id {} con_id {} transferred {} req {} mr_size {} data_size {}", get_hostname(), state.id, receiver.connection_id(), offset, state.nreqs, mr_size, s);
-        
-        //println!("{} plugin_irecv id {} nccl_metadata_list_len {}", get_hostname(), state.id, out_nccl_metadata_list.len());
-        let out_nccl_metadata = out_nccl_metadata_list.0.get_mut(state.current_slot as usize).unwrap();
-        out_nccl_metadata.address = mr.addr() + offset;
-        out_nccl_metadata.rkey = mr.rkey();
-        out_nccl_metadata.length = s as u64;
-        out_nccl_metadata.nreq = state.nreqs as u64;
-        out_nccl_metadata.request = *request.clone();
+    let state_ptr = state as *mut StateWrapper as *mut c_void;
+    unsafe { * _request = state_ptr };
 
-        let signaled = if state.slots == state.current_slot + 1 { true } else { false };
-
-        request.complete = signaled;
-
-        let send_wr = ibverbs_rs::IbvSendWr::new(
-            receiver.out_buffer_mr().addr(),
-            receiver.out_buffer_mr().lkey(),
-            receiver.in_remote_buffer_addr(),
-            receiver.in_remote_buffer_rkey(),
-            NcclMetadata::LEN as u64,
-            NcclMetadata::LEN as u64 * state.current_slot as u64,
-            IbvWrOpcode::RdmaWrite,
-            signaled,
-        );
-
-        println!("{} irecv con_id {} slot {} magix {} r_addr {} l_addr {} offset {} size {} mr_addr {} mr_length {} mr_rkey {}",
-            get_hostname(),
-            receiver.connection_id(),
-            state.current_slot,
-            magix,
-            receiver.in_remote_buffer_addr(),
-            receiver.out_buffer_mr().addr(),
-            NcclMetadata::LEN as u64 * state.current_slot as u64,
-            NcclMetadata::LEN as u64,
-            mr.addr(),
-            mr.length(),
-            mr.rkey()
-        );
-
-        if let Err(e) = receiver.qp_list[0].ibv_post_send(send_wr.as_ptr()){
-            println!("{} plugin_irecv post error {:#?}", get_hostname(), e);
-            log::error!("Error posting send: {:?}", e);
-            return 1;
-        }
-
-        address_list.push(offset);
-        state.transferred += s as u64;
-        state.current_slot += 1;
-        state.remaining = state.total_size - state.transferred;
-        state.remaining_slots = state.slots - state.current_slot;
-
-
-        Box::into_raw(mr);
-    }
-
-    if request.qp.is_none(){
-        panic!("{} irecv id {} con_id {} request {:?} qp is none", get_hostname(), state.id, receiver.connection_id(), request);
-    }
-
-    let cloned_request = request.clone();
-    state.requests[request_idx] = request;
-    if state.remaining == 0{
-        for i in 0..state.nreqs{
-            let mut request = Request::default();
-            request.id = i as u32;
-            state.requests[i as usize] = Box::new(request);
-        }
-        state.total_size = 0;
-        state.transferred = 0;
-        state.remaining = 0;
-        state.nreqs = 0;
-        state.req_idx = 0;
-        state.slots = 0;
-        state.current_slot = 0;
-        state.remaining_slots = 0;
-        state.request_id = 0;
-        
-    } else {
-        state.nreqs += 1;
-        state.req_idx += 1;
-        
-    }
-    state.posted += 1;
-
-    unsafe { * _request = Box::into_raw(cloned_request) as *mut c_void };
-    
     Box::into_raw(sender_receiver);
     0
 }
 extern "C" fn plugin_iflush(_recv_comm: *mut c_void, _n: c_int, _data: *mut *mut c_void, _sizes: *mut c_int, _mhandles: *mut *mut c_void, _request: *mut *mut c_void) -> ncclResult_t { 
-    let req = unsafe { Box::from_raw(_request as *mut Request) };
-    println!("{} plugin_iflush id {} con_id {} address {} req {}", get_hostname(), req.id, 0, req.address, 0);
-    //thread::sleep(std::time::Duration::from_secs(5));
     0
 }
 extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *mut c_int) -> ncclResult_t {
-    let req = unsafe { Box::from_raw(_request as *mut Request) };
-    let qp = req.qp.clone().unwrap();
-    let opcode = req.opcode.clone();
-    let send_recv = req.send_recv.clone();
-    let sizes = req.sizes;
-
-    match req.sender_receiver{
-        RequestSenderReceiver::Receiver => {
-            println!("{} test receiver {:?} opcode {:?}", get_hostname(),req, opcode);
-            thread::sleep(std::time::Duration::from_secs(2));
-            if req.complete {
-                println!("{} test receiver waiting for completion", get_hostname());
-                match qp.complete(1, opcode, send_recv, None){
-                    Ok(completed) => {
-                        println!("{} test receiver got {} completions", get_hostname(), completed);
-                        if completed == 0 {
-                            unsafe { _done.write(0) };
-                            return 0;
-                        } 
-                    },
-                    Err(e) => {
-                        println!("{} plugin_test complete error {:#?}", get_hostname(), e);
-                        log::error!("Error completing: {:?}", e);
-                        return 1;
-                    }
-                }
-
-            } else {
-                //println!("{} test s_r con_id {} magix {} sender_receiver {:?} waiting for completion", get_hostname(),req.connection_id, req.magix, req.sender_receiver);
+    unsafe { *_request = std::ptr::null_mut() as *mut c_void; };
+    println!("{} plugin_test", get_hostname());
+    let state_wrapper = unsafe { &*( _request as *mut StateWrapper ) };
+    println!("{} plugin_test x state {:?}", get_hostname(), state_wrapper);
+    let completions = state_wrapper.completions();
+    let qp = state_wrapper.cts_qp();
+    match qp.complete2(completions as usize, IbvWcOpcode::RdmaWrite, SendRecv::Send){
+        Ok(completed) => {
+            println!("{} plugin_test completed {}", get_hostname(), completed);
+            state_wrapper.dec_completions(completed as u32);
+            if completed > 0 {
+                unsafe { * _done = 1; }
             }
         },
-        RequestSenderReceiver::Sender => {
-            println!("{} test sender {:?} opcode {:?}", get_hostname(),req, opcode);
-            thread::sleep(std::time::Duration::from_secs(2));
-            if req.complete{
-                println!("{} test sender waiting for completion", get_hostname());
-                match qp.complete(1, opcode, send_recv, None){
-                    Ok(completed) => {
-                        println!("{} test sender got {} completions", get_hostname(), completed);
-                        if completed == 0 {
-                            unsafe { _done.write(0) };
-                            return 0;
-                        }
-                    },
-                    Err(e) => {
-                        println!("{} plugin_test complete error {:#?}", get_hostname(), e);
-                        log::error!("Error completing: {:?}", e);
-                        return 1;
-                    }
-                }
-
-            } else {
-                //println!("{} test s_r con_id {} magix {} sender_receiver {:?} waiting for completion", get_hostname(),req.connection_id, req.magix, req.sender_receiver);
-            }
+        Err(e) => {
+            log::error!("Error completing: {:?}", e);
+            return 1;
         }
-    };
-
-
-
-   
-    unsafe { _done.write(1) };
-    unsafe { std::ptr::copy_nonoverlapping(sizes.as_ptr(), _size, req.n as usize) };
-    _request = null_mut();
+    }
+    
+    
+    thread::sleep(std::time::Duration::from_secs(10));
     0
 }
 extern "C" fn plugin_close_send(_send_comm: *mut c_void) -> ncclResult_t { 
@@ -869,14 +710,14 @@ impl ControlBufferTrait for NcclMetadataList{
     }
     fn print(&self){
         for nccl_metadata in self.0.iter(){
-            println!("{} address {} rkey {} lkey {} length {} nreq {} req_id {}",
+            println!("{} address {} rkey {} lkey {} length {} nreqs {} idx {}",
                 get_hostname(),
                 nccl_metadata.address,
                 nccl_metadata.rkey,
                 nccl_metadata.lkey,
                 nccl_metadata.length,
-                nccl_metadata.nreq,
-                nccl_metadata.request.id
+                nccl_metadata.nreqs,
+                nccl_metadata.idx
             );
         }
     }
@@ -888,8 +729,8 @@ pub struct NcclMetadata{
     pub rkey: u32,
     pub lkey: u32,
     pub length: u64,
-    pub nreq: u64,
-    pub request: Request,
+    pub nreqs: u64,
+    pub idx: u64,
 }
 
 impl From<IbvMr> for NcclMetadata{
@@ -917,11 +758,11 @@ impl NcclMetadata{
 enum SenderReceiver{
     Sender{
         sender: Sender,
-        state: State,
+        state: StateWrapper,
     },
     Receiver{
         receiver: Receiver,
-        state: State,
+        state: StateWrapper,
     }
 }
 
@@ -1032,4 +873,11 @@ impl Default for Request{
             request_id: 0,
         }
     }
+}
+
+fn wrapping_add<T>(a: T, b: T, max: T) -> T
+where
+    T: std::ops::Add<Output = T> + std::ops::Rem<Output = T> + Copy,
+{
+    (a + b) % max
 }
