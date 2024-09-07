@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::f32::MAX;
 use std::ffi::{c_void, CStr};
 use std::fmt::Display;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -8,7 +9,6 @@ use std::ptr::null_mut;
 use std::{thread, time};
 use std::fmt::Debug;
 
-use bincode::de::read;
 use ibverbs_rs::receiver::Receiver;
 use ibverbs_rs::sender::Sender;
 use ibverbs_rs::{print_wr_ids, ControlBufferTrait, Hints, IbvAccessFlags, IbvMr, IbvQp, IbvRecvWr, IbvSendWr, IbvWcOpcode, IbvWrOpcode, LookUpBy, QpMode, SendRecv, SLOT_COUNT};
@@ -28,7 +28,7 @@ pub fn initialize_logger() {
     });
 }
 
-use libc::{c_int, size_t, stat, PTHREAD_RECURSIVE_MUTEX_INITIALIZER_NP};
+use libc::{c_int, size_t};
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 pub struct NcclNetSocketHandle {
@@ -47,120 +47,374 @@ pub struct RemoteHandle{
     psn: u32,
 }
 
-#[derive(Debug)]
+#[derive(Clone)]
+struct RequestWrapper(Arc<Mutex<Request>>);
+
+impl RequestWrapper{
+    fn new(idx: u32) -> Self{
+        RequestWrapper(Arc::new(Mutex::new(Request {
+            request_type: RequestType::Available,
+            connection_id: 0,
+            state_interface: None,
+            stage: RequestStage::SendMetadata,
+            idx,
+            sizes: Vec::new(),
+            id: 0,
+            completed: false,
+            md_completed: false,
+        })))
+    }
+    fn request_type(&self) -> RequestType {
+        let request = self.0.lock().unwrap();
+        request.request_type.clone()
+    }
+
+    fn connection_id(&self) -> u32 {
+        let request = self.0.lock().unwrap();
+        request.connection_id
+    }
+
+    fn set_request_type(&self, request_type: RequestType){
+        let mut request = self.0.lock().unwrap();
+        request.request_type = request_type;
+    }
+
+    fn set_connection_id(&self, connection_id: u32){
+        let mut request = self.0.lock().unwrap();
+        request.connection_id = connection_id;
+    }
+    fn set_state_interface(&self, state_interface: StateWrapper){
+        let mut request = self.0.lock().unwrap();
+        request.state_interface = Some(state_interface);
+    }
+    fn state_interface(&self) -> StateWrapper{
+        let request = self.0.lock().unwrap();
+        request.state_interface.clone().unwrap()
+    }
+    fn stage(&self) -> RequestStage{
+        let request = self.0.lock().unwrap();
+        request.stage.clone()
+    }
+    fn set_stage(&self, stage: RequestStage){
+        let mut request = self.0.lock().unwrap();
+        request.stage = stage;
+    }
+    fn idx(&self) -> u32{
+        let request = self.0.lock().unwrap();
+        request.idx
+    }
+    fn set_sizes(&self, sizes: Vec<u32>){
+        let mut request = self.0.lock().unwrap();
+        request.sizes = sizes;
+    }
+    fn sizes(&self) -> Vec<u32>{
+        let request = self.0.lock().unwrap();
+        request.sizes.clone()
+    }
+    fn id(&self) -> u64{
+        let request = self.0.lock().unwrap();
+        request.id
+    }
+    fn set_id(&self, id: u64){
+        let mut request = self.0.lock().unwrap();
+        request.id = id;
+    }
+    fn completed(&self) -> bool{
+        let request = self.0.lock().unwrap();
+        request.completed
+    }
+    fn set_completed(&self, completed: bool){
+        let mut request = self.0.lock().unwrap();
+        request.completed = completed;
+    }
+    fn md_completed(&self) -> bool{
+        let request = self.0.lock().unwrap();
+        request.md_completed
+    }
+    fn set_md_completed(&self, md_completed: bool){
+        let mut request = self.0.lock().unwrap();
+        request.md_completed = md_completed;
+    }
+    fn reset(&self){
+        let mut request = self.0.lock().unwrap();
+        request.request_type = RequestType::Available;
+        request.connection_id = 0;
+        request.state_interface = None;
+        request.stage = RequestStage::SendMetadata;
+        request.sizes = Vec::new();
+        request.id = 0;
+        request.completed = false;
+        request.md_completed = false;
+    }
+}
+
+impl Debug for RequestWrapper{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let request = self.0.lock().unwrap();
+        write!(f, "{:?}", request)
+    }
+}
+
+struct Request{
+    request_type: RequestType,
+    connection_id: u32,
+    state_interface: Option<StateWrapper>,
+    stage: RequestStage,
+    idx: u32,
+    sizes: Vec<u32>,
+    id: u64,
+    completed: bool,
+    md_completed: bool,
+}
+
+impl Debug for Request{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Request {{ request_type: {:?}, connection_id: {}, stage: {:?}, idx: {}, sizes: {:?}, id: {}, completed: {}, md_completed: {} }}",
+            self.request_type,
+            self.connection_id,
+            self.stage,
+            self.idx,
+            self.sizes,
+            self.id,
+            self.completed,
+            self.md_completed
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+enum RequestStage{
+    SendMetadata,
+    WaitForData,
+    WaitForSendCompletion,
+    Finished,
+}
+
+#[derive(Debug, Default, Clone)]
+enum RequestType{
+    SendData,
+    RecvData,
+    #[default]
+    Available,
+}
+
+trait StateInterface{
+    fn get_request(&self, idx: usize) -> Option<RequestWrapper>;
+    fn get_interface(self) -> Arc<Box<dyn StateInterface>>;
+    fn nccl_md_tail(&self) -> u32;
+    fn set_nccl_md_tail(&mut self, nccl_md_tail: u32);
+    fn connection_id(&self) -> u32;
+    fn id(&self) -> u32;
+    fn get_free_request(&self) -> Option<RequestWrapper>;
+    fn request_id(&self) -> u32;
+    fn set_request_id(&mut self, request_id: u32);
+    fn inc_completions(&mut self, completions: u32);
+    fn inc_nccl_md_tail(&mut self, n: u32, max_requests: u32);
+    fn completions(&self) -> u32;
+    fn dec_completions(&mut self, completions: u32);
+    fn md_completions(&self) -> u32;
+    fn inc_md_completions(&mut self, completions: u32);
+    fn dec_md_completions(&mut self, completions: u32);
+    fn set_qp(&mut self, qp: IbvQp);
+    fn qp(&self) -> IbvQp;
+}
+
+#[derive(Clone)]
+struct StateWrapper(Arc<Mutex<Box<dyn StateInterface>>>);
+impl StateWrapper{
+    fn new(state_interface: Box<dyn StateInterface>) -> Self{
+        StateWrapper(Arc::new(Mutex::new(state_interface)))
+    }
+    fn id(&self) -> u32{
+        let state_interface = self.0.lock().unwrap();
+        state_interface.id()
+    }
+    fn connection_id(&self) -> u32{
+        let state_interface = self.0.lock().unwrap();
+        state_interface.connection_id()
+    }
+    fn nccl_md_tail(&self) -> u32{
+        let state_interface = self.0.lock().unwrap();
+        state_interface.nccl_md_tail()
+    }
+    fn set_nccl_md_tail(&mut self, nccl_md_tail: u32){
+        let mut state_interface = self.0.lock().unwrap();
+        state_interface.set_nccl_md_tail(nccl_md_tail);
+    }
+    fn get_free_request(&self) -> Option<RequestWrapper>{
+        let state_interface = self.0.lock().unwrap();
+        state_interface.get_free_request()
+    }
+    fn request_id(&self) -> u32{
+        let state_interface = self.0.lock().unwrap();
+        state_interface.request_id()
+    }
+    fn set_request_id(&mut self, request_id: u32){
+        let mut state_interface = self.0.lock().unwrap();
+        state_interface.set_request_id(request_id);
+    }
+    fn inc_nccl_md_tail(&mut self, n: u32, max_requests: u32) {
+        let mut state_interface = self.0.lock().unwrap();
+        state_interface.inc_nccl_md_tail(n, max_requests);
+    }
+    fn get_request(&self, idx: usize) -> Option<RequestWrapper>{
+        let state_interface = self.0.lock().unwrap();
+        state_interface.get_request(idx)
+    }
+    fn completions(&self) -> u32{
+        let state_interface = self.0.lock().unwrap();
+        state_interface.completions()
+    }
+    fn inc_completions(&mut self, completions: u32){
+        let mut state_interface = self.0.lock().unwrap();
+        state_interface.inc_completions(completions);
+    }
+    fn dec_completions(&mut self, completions: u32){
+        let mut state_interface = self.0.lock().unwrap();
+        state_interface.dec_completions(completions);
+    }
+    fn md_completions(&self) -> u32{
+        let state_interface = self.0.lock().unwrap();
+        state_interface.md_completions()
+    }
+    fn inc_md_completions(&mut self, completions: u32){
+        let mut state_interface = self.0.lock().unwrap();
+        state_interface.inc_md_completions(completions);
+    }
+    fn dec_md_completions(&mut self, completions: u32){
+        let mut state_interface = self.0.lock().unwrap();
+        state_interface.dec_md_completions(completions);
+    }
+    fn set_qp(&mut self, qp: IbvQp){
+        let mut state_interface = self.0.lock().unwrap();
+        state_interface.set_qp(qp);
+    }
+    fn qp(&self) -> IbvQp{
+        let state_interface = self.0.lock().unwrap();
+        state_interface.qp()
+    }
+}
+
+
 struct State{
     id: u32,
     connection_id: u32,
     nccl_md_tail: u32,
     recv_send: SendRecv,
-    requests: HashMap<u32, Vec<u64>>,
+    requests: [RequestWrapper; MAX_REQUESTS as usize],
+    request_idx: u32,
     request_id: u32,
     sub_request_id: u32,
     completions: u32,
+    metadata_completions: u32,
     cts_qp: Option<IbvQp>,
 }
 
-struct StateWrapper(Arc<Mutex<State>>);
 
-impl Debug for StateWrapper{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let locked_state = self.0.lock().unwrap();
-        write!(f, "{:?}", locked_state)
+impl StateInterface for State{
+    fn inc_nccl_md_tail(&mut self, n: u32, max_requests: u32) {
+        self.nccl_md_tail = (self.nccl_md_tail + n) % max_requests;
     }
-}
-
-impl StateWrapper{
-    fn new(state: State) -> Self {
-        StateWrapper(Arc::new(Mutex::new(state)))
+    fn get_request(&self, idx: usize) -> Option<RequestWrapper>{
+        self.requests.get(idx).map(|request| request.clone())
     }
-    fn id(&self) -> u32 {
-        let locked_state = self.0.lock().unwrap();
-        locked_state.id
+    fn get_interface(self) -> Arc<Box<dyn StateInterface>>{
+        Arc::new(Box::new(self))
+    }
+    fn nccl_md_tail(&self) -> u32{
+        self.nccl_md_tail
+    }
+    fn set_nccl_md_tail(&mut self, nccl_md_tail: u32){
+        self.nccl_md_tail = nccl_md_tail;
+    }
+    fn connection_id(&self) -> u32{
+        self.connection_id
+    }
+    fn id(&self) -> u32{
+        self.id
+    }
+    fn get_free_request(&self) -> Option<RequestWrapper> {
+        for request in self.requests.iter(){
+            if let RequestType::Available = request.request_type(){
+                return Some(request.clone());
+            }
+        }
+        None
+    }
+    fn request_id(&self) -> u32{
+        self.request_id
+    }
+    fn set_request_id(&mut self, request_id: u32) {
+        self.request_id = request_id;
+    }
+    fn inc_completions(&mut self, completions: u32) {
+        self.completions += completions;
     }
     fn completions(&self) -> u32 {
-        let locked_state = self.0.lock().unwrap();
-        locked_state.completions
+        self.completions
     }
-    fn insert_request(&self, request_id: u32, local_address: u64){
-        let mut locked_state = self.0.lock().unwrap();
-        let requests = locked_state.requests.entry(request_id).or_insert(Vec::new());
-        requests.push(local_address);
+    fn dec_completions(&mut self, completions: u32) {
+        if self.completions >= completions {
+            self.completions -= completions;
+        }
     }
-    fn connection_id(&self) -> u32 {
-        let locked_state = self.0.lock().unwrap();
-        locked_state.connection_id
+    fn md_completions(&self) -> u32 {
+        self.metadata_completions
     }
-    fn nccl_md_tail(&self) -> u32 {
-        let locked_state = self.0.lock().unwrap();
-        locked_state.nccl_md_tail
+    fn inc_md_completions(&mut self, completions: u32) {
+        let prev = self.metadata_completions;
+        self.metadata_completions += completions;
+        println!("{} inc_md_completions prev {} added {} act {}", get_hostname(), prev, completions, self.metadata_completions);
     }
-    fn recv_send(&self) -> SendRecv {
-        let locked_state = self.0.lock().unwrap();
-        locked_state.recv_send.clone()
+    fn dec_md_completions(&mut self, completions: u32) {
+        let prev = self.metadata_completions;
+        if self.metadata_completions >= completions {
+            self.metadata_completions -= completions;
+        }
+        println!("{} dec_md_completions prev {} sub {} act {}", get_hostname(), prev, completions, self.metadata_completions);
     }
-    fn request_id(&self) -> u32 {
-        let locked_state = self.0.lock().unwrap();
-        locked_state.request_id
+    fn set_qp(&mut self, qp: IbvQp) {
+        self.cts_qp = Some(qp);
     }
-    fn sub_request_id(&self) -> u32 {
-        let locked_state = self.0.lock().unwrap();
-        locked_state.sub_request_id
-    }
-    fn set_ncc_md_tail(&self, nccl_md_tail: u32){
-        let mut locked_state = self.0.lock().unwrap();
-        locked_state.nccl_md_tail = nccl_md_tail;
-    }
-    fn set_request_id(&self, request_id: u32){
-        let mut locked_state = self.0.lock().unwrap();
-        locked_state.request_id = request_id;
-    }
-    fn set_sub_request_id(&self, sub_request_id: u32){
-        let mut locked_state = self.0.lock().unwrap();
-        locked_state.sub_request_id = sub_request_id;
-    }
-    fn inc_nccl_md_tail(&self, v: u32, max: u32) {
-        let mut locked_state = self.0.lock().unwrap();
-        locked_state.nccl_md_tail = (locked_state.nccl_md_tail + v) % max;
-    }
-    fn inc_completions(&self, inc: u32){
-        let mut locked_state = self.0.lock().unwrap();
-        locked_state.completions += inc;
-    }
-    fn dec_completions(&self, dec: u32){
-        let mut locked_state = self.0.lock().unwrap();
-        locked_state.completions -= dec;
-    }
-    fn dec_nccl_md_tail(&self, v: u32, max: u32) {
-        let mut locked_state = self.0.lock().unwrap();
-        locked_state.nccl_md_tail = (locked_state.nccl_md_tail - v) % max;
-    }
-    fn set_cts_qp(&self, qp: IbvQp){
-        let mut locked_state = self.0.lock().unwrap();
-        locked_state.cts_qp = Some(qp);
-    }
-    fn cts_qp(&self) -> IbvQp{
-        let locked_state = self.0.lock().unwrap();
-        locked_state.cts_qp.clone().unwrap()
-    }
-    fn print(&self){
-        let locked_state = self.0.lock().unwrap();
-        println!("{:?}", locked_state);
+    fn qp(&self) -> IbvQp {
+        self.cts_qp.clone().unwrap()
     }
 }
 
-const NCCL_METADATA_SLOTS: usize = 255;
+impl Debug for State{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "State {{ id: {}, connection_id: {}, nccl_md_tail: {}, recv_send: {:?}, request_id: {}, sub_request_id: {}, completions: {}, md_completions: {}, cts_qp: {:?} }}",
+            self.id,
+            self.connection_id,
+            self.nccl_md_tail,
+            self.recv_send,
+            self.request_id,
+            self.sub_request_id,
+            self.completions,
+            self.metadata_completions,
+            self.cts_qp
+        )
+    }
+}
 
 impl Default for State{
     fn default() -> Self {
+        let mut request_vec = Vec::with_capacity(MAX_REQUESTS as usize);
+        for idx in 0..MAX_REQUESTS{
+            request_vec.push(RequestWrapper::new(idx));
+        }
+        let requests: [RequestWrapper; MAX_REQUESTS as usize] = request_vec.try_into().unwrap();
         State{
             id: 0,
             connection_id: 0,
             nccl_md_tail: 0,
             recv_send: SendRecv::Send,
             request_id: 0,
+            request_idx: 0,
             sub_request_id: 0,
             completions: 0,
-            requests: HashMap::new(),
+            metadata_completions: 0,
+            requests,
             cts_qp: None,
         }
     }
@@ -234,7 +488,10 @@ extern "C" fn plugin_listen(_dev: c_int, handle: *mut c_void, listen_comm: *mut 
     state.id = rand::random::<u32>();
     state.connection_id = receiver.connection_id();
     state.recv_send = SendRecv::Recv;
-    let listen_comm_handle = Box::into_raw(Box::new(SenderReceiver::Receiver { receiver, state: StateWrapper::new(state) }));
+    let listen_comm_handle = Box::into_raw(Box::new(SenderReceiver::Receiver { 
+        receiver,
+        state: StateWrapper::new(Box::new(state)), 
+    }));
     if !listen_comm.is_null() {
         unsafe {
             *listen_comm = listen_comm_handle as *mut c_void;
@@ -304,7 +561,7 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
     state.recv_send = SendRecv::Send;
     let sender_handle = Box::into_raw(Box::new(SenderReceiver::Sender{
         sender,
-        state: StateWrapper::new(state),
+        state: StateWrapper::new(Box::new(state)),
     }));
 
     unsafe {
@@ -319,6 +576,18 @@ extern "C" fn plugin_accept(listen_comm: *mut c_void, recv_comm: *mut *mut c_voi
             log::error!("Error accepting: {:?}", e);
             return 1;
         }
+        let in_buffer_ptr = receiver.in_buffer_ptr();
+        let out_buffer_ptr = receiver.out_buffer_ptr();
+        let in_buffer_mr = receiver.in_buffer_mr();
+        let out_buffer_mr = receiver.out_buffer_mr();
+        println!("{} irecv con_id {} in_buffer_ptr {} out_buffer_ptr {} in_buffer_mr {} out_buffer_mr {}",
+            get_hostname(),
+            receiver.connection_id(),
+            in_buffer_ptr as u64,
+            out_buffer_ptr as u64,
+            in_buffer_mr.addr(),
+            out_buffer_mr.addr()
+        );
         let receiver_handle = Box::into_raw(sender_receiver);
         unsafe {
             *recv_comm = receiver_handle as *mut c_void;
@@ -366,6 +635,15 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
         log::error!("Error accepting: {:?}", "Not a sender");
         return 1;
     };
+
+    let request = state.get_free_request().unwrap();
+
+    request.set_request_type(RequestType::SendData);
+    request.set_connection_id(state.connection_id());
+    request.set_state_interface(state.clone());
+    request.set_stage(RequestStage::WaitForSendCompletion);
+    request.set_sizes(vec![_size as u32]);
+
     let nccl_md_tail = state.nccl_md_tail();
 
     let start_position = nccl_md_tail % MAX_REQUESTS;
@@ -373,6 +651,10 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
     let in_nccl_metadata_list = sender.in_buffer_ptr() as *mut NcclMetadataList;
     let in_nccl_metadata_list: &mut NcclMetadataList = unsafe { &mut *in_nccl_metadata_list };
     let in_nccl_metadata = in_nccl_metadata_list.0.get_mut(start_position as usize).unwrap();
+    let req_id = in_nccl_metadata.context;
+    request.set_id(req_id);
+    println!("{} isend con_id {} in_nccl_metadata {:?}", get_hostname(), state.connection_id(), in_nccl_metadata);
+
     let mhandle_mr = unsafe { Box::from_raw(_mhandle as *mut IbvMr) };
 
     let send_wr = ibverbs_rs::IbvSendWr::new(
@@ -384,7 +666,8 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
         0,
         IbvWrOpcode::RdmaWrite,
         true,
-        None,
+        Some(request.idx() as u64),
+        true,
     );
 
     if let Err(e) = sender.qp_list[0].ibv_post_send(send_wr.as_ptr()){
@@ -392,11 +675,14 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
         log::error!("Error posting send: {:?}", e);
         return 1;
     }
+    state.inc_completions(1);
     state.inc_nccl_md_tail(1, MAX_REQUESTS);
+    state.set_qp(sender.qp_list[0].clone());
 
-    let arc_ptr = Arc::as_ptr(&state.0) as *mut State;
-    let state_void_ptr = arc_ptr as *mut c_void;
-    unsafe { * _request = state_void_ptr };
+    let request_box = Box::new(request);
+    let request_ptr: *mut RequestWrapper = Box::into_raw(request_box);
+    let request_ptr_as_c_void: *mut c_void = request_ptr as *mut c_void;
+    unsafe { * _request = request_ptr_as_c_void };
 
     Box::into_raw(mhandle_mr);
     Box::into_raw(sender_receiver);
@@ -414,10 +700,26 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
         return 1;
     };
 
+
+    let request = state.get_free_request().unwrap();
+
+    request.set_request_type(RequestType::RecvData);
+    request.set_connection_id(state.connection_id());
+    request.set_state_interface(state.clone());
+    let req_id = rand::random::<u16>();
+    request.set_id(req_id as u64);
+
     let nccl_md_tail = state.nccl_md_tail();
-    state.set_sub_request_id(rand::random::<u32>());
+    //state.sub_request_id = rand::random::<u32>();
 
     let start_position = nccl_md_tail % MAX_REQUESTS;
+
+    let recv_wr = IbvRecvWr::new(None, Some(request.idx() as u64));
+    if let Err(e) = receiver.qp_list[0].ibv_post_recv(recv_wr){
+        log::error!("Error posting receive: {:?}", e);
+        return 1;
+    }
+    state.inc_completions(1);
 
     let out_nccl_metadata_list = receiver.out_buffer_ptr() as *mut NcclMetadataList;
     let out_nccl_metadata_list: &mut NcclMetadataList = unsafe { &mut *out_nccl_metadata_list };
@@ -429,24 +731,18 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
         let mhandle = unsafe { *mhandles.offset(idx as isize) };
         let mhandle_mr = unsafe { Box::from_raw(mhandle as *mut IbvMr) };
         let data = unsafe { * _data.offset(idx as isize) };
-
-        println!("{} plugin_irecv data addr {}",
-            get_hostname(),
-            data as u64
-        );
-
         if data as u64 == mhandle_mr.addr() {
             state.set_request_id(rand::random::<u32>());
         }
-
-        state.insert_request(state.request_id(), data as u64);
-
         let out_nccl_metadata = out_nccl_metadata_list.0.get_mut(position as usize).unwrap();
-        out_nccl_metadata.address = _data as u64;
+        out_nccl_metadata.address = data as u64;
         out_nccl_metadata.rkey = mhandle_mr.rkey();
         out_nccl_metadata.length = size as u64;
         out_nccl_metadata.nreqs = n as u64;
-        out_nccl_metadata.idx = state.nccl_md_tail() as u64 + 1;
+        out_nccl_metadata.idx = request.idx() as u64;
+        out_nccl_metadata.context = request.id();
+        println!("{} irecv con_id {} md_tail {} {:?}", get_hostname(), state.connection_id(), state.nccl_md_tail(), out_nccl_metadata);
+        //state.insert_request(position as usize, out_nccl_metadata.clone());
         Box::into_raw(mhandle_mr);
     }
 
@@ -459,31 +755,26 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
         NcclMetadata::LEN as u64 * state.nccl_md_tail() as u64,
         IbvWrOpcode::RdmaWrite,
         true,
-        None,
+        Some(request.idx() as u64 + MAX_REQUESTS as u64),
+        false,
     );
+    print_wr_ids(send_wr.as_ptr());
 
-    state.inc_completions(1);
 
     if let Err(e) = receiver.qp_list[0].ibv_post_send(send_wr.as_ptr()){
         println!("{} plugin_irecv post error {:#?}", get_hostname(), e);
         log::error!("Error posting send: {:?}", e);
         return 1;
     }
-    state.set_cts_qp(receiver.qp_list[0].clone());
+
+    state.inc_md_completions(1);
     state.inc_nccl_md_tail(n as u32, MAX_REQUESTS);
+    state.set_qp(receiver.qp_list[0].clone());
 
-    /*
-    let recv_wr = IbvRecvWr::new(None, Some(magix as u64));
-    if let Err(e) = receiver.qp_list[0].ibv_post_recv(recv_wr){
-        log::error!("Error posting receive: {:?}", e);
-        return 1;
-    }
-    */
-
-
-
-    let state_ptr = state as *mut StateWrapper as *mut c_void;
-    unsafe { * _request = state_ptr };
+    let request_box = Box::new(request);
+    let request_ptr: *mut RequestWrapper = Box::into_raw(request_box);
+    let request_ptr_as_c_void: *mut c_void = request_ptr as *mut c_void;
+    unsafe { * _request = request_ptr_as_c_void };
 
     Box::into_raw(sender_receiver);
     0
@@ -492,18 +783,181 @@ extern "C" fn plugin_iflush(_recv_comm: *mut c_void, _n: c_int, _data: *mut *mut
     0
 }
 extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *mut c_int) -> ncclResult_t {
-    unsafe { *_request = std::ptr::null_mut() as *mut c_void; };
-    println!("{} plugin_test", get_hostname());
-    let state_wrapper = unsafe { &*( _request as *mut StateWrapper ) };
-    println!("{} plugin_test x state {:?}", get_hostname(), state_wrapper);
+    let request_ptr = _request as *mut RequestWrapper;
+    let request = unsafe { Box::from_raw(request_ptr) };
+    unsafe { * _done = 0; }
+    let mut state_interface = request.state_interface();
+    match request.request_type(){
+        RequestType::SendData => {
+            match request.stage(){
+                RequestStage::WaitForSendCompletion => {
+                    if request.completed(){
+                        println!("{} test {:?} completed", get_hostname(), request);
+                        request.set_stage(RequestStage::Finished);
+                    } else {
+                        let completions = state_interface.completions();
+                        let qp = state_interface.qp();
+                        //let completions = 1;
+                        println!("{} test {:?} waiting for {} completions", get_hostname(), request, completions);
+                        match qp.complete2(completions as usize, IbvWcOpcode::RdmaWrite, SendRecv::Send){
+                            Ok((completed, wr_id_list)) => {
+                                state_interface.dec_completions(completed as u32);
+                                if completed > 0 {
+                                    println!("{} test {:?} completed {} wrs {:?}", get_hostname(), request, completed, wr_id_list);
+                                    for (wr_id,_imm) in wr_id_list{
+                                        let req = state_interface.get_request(wr_id as usize).unwrap();
+                                        req.set_completed(true);
+                                    }
+                                } else {
+                                    println!("{} test {:?} completed {} 0 wrs", get_hostname(), request, completed);
+                                }
+                                thread::sleep(std::time::Duration::from_secs(1));
+                                
+                            },
+                            Err(e) => {
+                                log::error!("Error completing: {:?}", e);
+                                return 1;
+                            }
+                        }
+                    }
+                },
+                RequestStage::Finished => {
+                    println!("{} test {:?}", get_hostname(), request);
+                    thread::sleep(std::time::Duration::from_secs(1));
+                    let sizes = request.sizes();
+                    let mut size = 0;
+                    for s in sizes{
+                        size += s;
+                    }
+                    unsafe { * _size = size as i32; }
+                    unsafe { * _done = 1; }
+                    //request.reset();
+                    _request = null_mut();
+                    return 0;
+                },
+                _ => {
+                    println!("{} test {:?} ERROR", get_hostname(), request);
+                }
+            }
+        },
+        RequestType::RecvData => {
+            match request.stage(){
+                RequestStage::SendMetadata => {
+                    if request.md_completed(){
+                        println!("{} test {:?} completed", get_hostname(), request);
+                        request.set_stage(RequestStage::WaitForData);
+                    } else {
+                        let md_completions = state_interface.md_completions();
+                        let qp = state_interface.qp();
+                        println!("{} test {:?} waiting for {} md_completions", get_hostname(), request, md_completions);
+                        match qp.complete2(md_completions as usize, IbvWcOpcode::RdmaWrite, SendRecv::Send){
+                            Ok((completed, wr_id_list)) => {
+                                println!("{} test {:?} completed {} wrs {:?}", get_hostname(), request, completed, wr_id_list);
+                                if completed > 0 {
+                                    for (wr_id, imm) in wr_id_list{
+                                        if wr_id < MAX_REQUESTS as u64{
+                                            let req = state_interface.get_request(wr_id as usize).unwrap();
+                                            req.set_sizes(vec![imm]);
+                                            req.set_completed(true);
+                                            state_interface.dec_completions(1);
+                                        } else {
+                                            let req_idx = (wr_id - MAX_REQUESTS as u64) as usize;
+                                            let req = state_interface.get_request(req_idx).unwrap();
+                                            req.set_md_completed(true);
+                                            state_interface.dec_md_completions(1);
+                                        }
+                                    }
+                                }
+                                thread::sleep(std::time::Duration::from_secs(1));
+                            },
+                            Err(e) => {
+                                log::error!("Error completing: {:?}", e);
+                                return 1;
+                            }
+                        }
+                    }
+                },
+                RequestStage::WaitForData => {
+                    if request.completed(){
+                        println!("{} test {:?} completed", get_hostname(), request);
+                        request.set_stage(RequestStage::Finished);
+                    } else {
+                        let completions = state_interface.completions();
+                        let qp = state_interface.qp();
+                        //completions = 1;
+                        println!("{} test {:?} waiting for {} completions", get_hostname(), request, completions);
+                        match qp.complete2(completions as usize, IbvWcOpcode::RecvRdmaWithImm, SendRecv::Recv){
+                            Ok((completed, wr_id_list)) => {
+                                println!("{} test {:?} completed {} wrs {:?}", get_hostname(), request, completed, wr_id_list);
+                                if completed > 0 {
+                                    for (wr_id, imm) in wr_id_list{
+                                        if wr_id < MAX_REQUESTS as u64{
+                                            let req = state_interface.get_request(wr_id as usize).unwrap();
+                                            req.set_completed(true);
+                                            req.set_sizes(vec![imm]);
+                                            state_interface.dec_completions(1);
+                                        } else {
+                                            let req_idx = (wr_id - MAX_REQUESTS as u64) as usize;
+                                            let req = state_interface.get_request(req_idx).unwrap();
+                                            req.set_md_completed(true);
+                                            state_interface.dec_md_completions(1);
+                                        }
+                                    }
+                                }
+                                thread::sleep(std::time::Duration::from_secs(1));
+                            },
+                            Err(e) => {
+                                log::error!("Error completing: {:?}", e);
+                                return 1;
+                            }
+                        }
+                    }
+                },
+                RequestStage::Finished => {
+                    println!("{} test {:?}", get_hostname(), request);
+                    thread::sleep(std::time::Duration::from_secs(1));
+                    let sizes = request.sizes();
+                    let mut size = 0;
+                    for s in sizes{
+                        size += s;
+                    }
+                    unsafe { * _size = size as i32; }
+                    unsafe { * _done = 1; }
+                    //request.reset();
+                    _request = null_mut();
+                    return 0;
+                },
+                _ => {
+                    println!("{} test {:?} ERROR", get_hostname(), request);
+                }
+            }
+        },
+        RequestType::Available => {
+            println!("{} test con_id {} available", get_hostname(), request.connection_id());
+        }
+    }
+    Box::into_raw(request);
+
+
+    /*
     let completions = state_wrapper.completions();
     let qp = state_wrapper.cts_qp();
-    match qp.complete2(completions as usize, IbvWcOpcode::RdmaWrite, SendRecv::Send){
-        Ok(completed) => {
-            println!("{} plugin_test completed {}", get_hostname(), completed);
+    println!("{} test con_id {} waiting for completions {}", get_hostname(), state_wrapper.connection_id(), completions);
+    match qp.complete(completions as usize, IbvWcOpcode::RdmaWrite, SendRecv::Send, None){
+        Ok((completed, wr_id_list)) => {
+            println!("{} test con_id {} completed {}", get_hostname(), state_wrapper.connection_id(), completed);
             state_wrapper.dec_completions(completed as u32);
             if completed > 0 {
+                for wr_id in wr_id_list{
+                    let request_position = wr_id;
+                    state_wrapper.set_request_idx(wr_id as u32);
+                    let metadata = metadata_addr as *mut NcclMetadata;
+                    let metadata = unsafe { &*metadata };
+                    println!("{} test con_id {} wr_id {} metadata {:?}", get_hostname(), state_wrapper.connection_id(), wr_id, metadata);
+                }
                 unsafe { * _done = 1; }
+                _request = null_mut();
+                return 0;
             }
         },
         Err(e) => {
@@ -511,9 +965,26 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
             return 1;
         }
     }
+    */
     
-    
-    thread::sleep(std::time::Duration::from_secs(10));
+    /*
+    match qp.complete2(completions as usize, IbvWcOpcode::RdmaWrite, SendRecv::Send){
+        Ok((completed, wr_ids)) => {
+            println!("{} plugin_test completed {} wr_ids: {:?}", get_hostname(), completed, wr_ids);
+            
+            state_wrapper.dec_completions(completed as u32);
+            if completed > 0 {
+                unsafe { * _done = 1; }
+                _request = null_mut();
+                return 0;
+            }
+        },
+        Err(e) => {
+            log::error!("Error completing: {:?}", e);
+            return 1;
+        }
+    }
+    */
     0
 }
 extern "C" fn plugin_close_send(_send_comm: *mut c_void) -> ncclResult_t { 
@@ -710,14 +1181,15 @@ impl ControlBufferTrait for NcclMetadataList{
     }
     fn print(&self){
         for nccl_metadata in self.0.iter(){
-            println!("{} address {} rkey {} lkey {} length {} nreqs {} idx {}",
+            println!("{} address {} rkey {} lkey {} length {} nreqs {} idx {} ctx {}",
                 get_hostname(),
                 nccl_metadata.address,
                 nccl_metadata.rkey,
                 nccl_metadata.lkey,
                 nccl_metadata.length,
                 nccl_metadata.nreqs,
-                nccl_metadata.idx
+                nccl_metadata.idx,
+                nccl_metadata.context
             );
         }
     }
@@ -731,6 +1203,7 @@ pub struct NcclMetadata{
     pub length: u64,
     pub nreqs: u64,
     pub idx: u64,
+    pub context: u64,
 }
 
 impl From<IbvMr> for NcclMetadata{
@@ -764,120 +1237,4 @@ enum SenderReceiver{
         receiver: Receiver,
         state: StateWrapper,
     }
-}
-
-#[derive(Clone, Debug)]
-enum RequestSenderReceiver{
-    Sender,
-    Receiver
-}
-
-#[derive(Clone)]
-pub struct Request{
-    id: u32,
-    state_id: u32,
-    n: u32,
-    nreq: u32,
-    slot: u32,
-    total_slots: u32,
-    connection_id: u32,
-    size: u64,
-    done: bool,
-    sender_receiver: RequestSenderReceiver,
-    address: u64,
-    offset: u64,
-    offset_address: u64,
-    rkey: u32,
-    sizes: [i32; 8],
-    qp: Option<IbvQp>,
-    opcode: IbvWcOpcode,
-    send_recv: SendRecv,
-    magix: u32,
-    md_local_address: u64,
-    md_remote_address: u64,
-    md_offset: u64,
-    md_local_offset_addr: u64,
-    md_remote_offset_addr: u64,
-    md_rkey: u32,
-    md_lkey: u32,
-    md_length: u64,
-    complete: bool,
-    request_id: u32,
-
-}
-
-impl Debug for Request{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Request {{ id: {}, state_id: {}, n: {}, nreq: {}, slot: {}, total_slots: {}, connection_id: {}, size: {}, done: {}, sender_receiver: {:?}, address: {}, offset: {}, offset_addr: {} rkey: {}, sizes: {:?} magix {} md_local_address {} md_remote_address {} md_offset {} md_local_offset_addr {} md_remote_offset_addr {} md_rkey {} md_lkey {} md_length {} complete {} request_id {}}}",
-            self.id,
-            self.state_id,
-            self.n,
-            self.nreq,
-            self.slot,
-            self.total_slots,
-            self.connection_id,
-            self.size,
-            self.done,
-            self.sender_receiver,
-            self.address,
-            self.offset,
-            self.offset_address,
-            self.rkey,
-            self.sizes,
-            self.magix,
-            self.md_local_address,
-            self.md_remote_address,
-            self.md_offset,
-            self.md_local_offset_addr,
-            self.md_remote_offset_addr,
-            self.md_rkey,
-            self.md_lkey,
-            self.md_length,
-            self.complete,
-            self.request_id,
-        )
-    }
-}
-
-impl Default for Request{
-    fn default() -> Self {
-        Request{
-            id: 0,
-            state_id: 0,
-            n: 0,
-            nreq: 0,
-            slot: 0,
-            total_slots: 0,
-            connection_id: 0,
-            size: 0,
-            done: false,
-            sender_receiver: RequestSenderReceiver::Sender,
-            address: 0,
-            offset: 0,
-            offset_address: 0,
-            rkey: 0,
-            sizes: [0; 8],
-            qp: None,
-            opcode: IbvWcOpcode::RdmaWrite,
-            send_recv: SendRecv::Send,
-            magix: 0,
-            md_local_address: 0,
-            md_remote_address: 0,
-            md_offset: 0,
-            md_local_offset_addr: 0,
-            md_remote_offset_addr: 0,
-            md_rkey: 0,
-            md_lkey: 0,
-            md_length: 0,
-            complete: false,
-            request_id: 0,
-        }
-    }
-}
-
-fn wrapping_add<T>(a: T, b: T, max: T) -> T
-where
-    T: std::ops::Add<Output = T> + std::ops::Rem<Output = T> + Copy,
-{
-    (a + b) % max
 }
