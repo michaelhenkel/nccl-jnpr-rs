@@ -104,6 +104,7 @@ struct Request{
     id: u64,
     completed: bool,
     md_completed: bool,
+    md_idx: u32,
 }
 
 impl Request{
@@ -117,6 +118,7 @@ impl Request{
             id: 0,
             completed: false,
             md_completed: false,
+            md_idx: 0,
         }
     }
     fn reset(&mut self){
@@ -460,6 +462,9 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
         std::thread::sleep(std::time::Duration::from_micros(1));
         //info!("{} isend waiting for metadata", get_hostname());
     }
+    if start_position as usize != in_nccl_metadata.md_idx as usize{
+        println!("{} isend start_position {} in_nccl_metadata.md_idx {}", get_hostname(), start_position, in_nccl_metadata.md_idx);
+    }
 
 
     let req_id = in_nccl_metadata.context;
@@ -477,6 +482,7 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
         Some(data_request_idx),
         true,
     );
+
     //info!("{} isend {:?}", get_hostname(), request_lock);
 
     let wrs_debug = debug_wr(send_wr.as_ptr());
@@ -498,6 +504,13 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
         request_idx: data_request_idx,
         data_tracker: state.data_tracker.clone(),
     };
+
+    in_nccl_metadata.address = 0;
+    in_nccl_metadata.rkey = 0;
+    in_nccl_metadata.length = 0;
+    in_nccl_metadata.nreqs = 0;
+    in_nccl_metadata.idx = 0;
+    in_nccl_metadata.context = 0;
 
     let test_request_box = Box::new(test_request);
     let test_request_ptr: *mut TestRequest = Box::into_raw(test_request_box);
@@ -571,8 +584,11 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
         out_nccl_metadata.nreqs = n as u64;
         out_nccl_metadata.idx = request_lock.idx as u64;
         out_nccl_metadata.context = request_lock.id;
+        out_nccl_metadata.md_idx = position as u64;
         Box::into_raw(mhandle_mr);
     }
+
+    //info!("{} irecv {:?}", get_hostname(), request_lock);
 
     let send_wr = ibverbs_rs::IbvSendWr::new(
         receiver.out_buffer_mr().addr(),
@@ -620,11 +636,76 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
     unsafe { * _done = 0; }
     let request_idx = boxed_test_request.request_idx;
     let request_manager = boxed_test_request.request_manager.clone();
-    let request = request_manager.get_request(request_idx as usize).unwrap();
-    let mut locked_request = request.lock().unwrap();
+    //let request = request_manager.get_request(request_idx as usize).unwrap();
+    //let mut locked_request = request.lock().unwrap();
     let qp = boxed_test_request.qp.clone();
     let completion_tracker: Arc<CompletionTracker> = boxed_test_request.completion_tracker.clone();
     let data_tracker: Arc<DataTracker> = boxed_test_request.data_tracker.clone();
+
+    {
+        let request = request_manager.get_request(request_idx as usize).unwrap();
+        let mut request = request.lock().unwrap();
+        //info!("{} test {:?} completed", get_hostname(), request);
+        if request.completed{
+
+            let sizes = &request.sizes;
+            let mut size = 0;
+            for s in sizes{
+                size += s;
+            }
+            if let RequestType::RecvData = request.request_type{
+                data_tracker.increment_actual_recv(size as u64);
+                //println!("{} test expected recv data {} actual recv data {} con_id {}", get_hostname(), data_tracker.expected_recv(), data_tracker.actual_recv(), request.connection_id);
+            }
+            unsafe { * _size = size as i32; }
+            unsafe { * _done = 1; }
+            request_manager.complete_request(request_idx);
+            request.reset();
+            _request = null_mut();
+            return 0;
+        }
+    }
+
+    let outstanding_completions = completion_tracker._get_num_of_combined_uncompleted_requests();
+
+    //info!("{} test outstanding completions: {}", get_hostname(), completion_tracker._get_num_of_combined_uncompleted_requests());
+    let wr_list = match qp.poll_complete(outstanding_completions as usize, IbvWcOpcode::RdmaWrite){
+        Ok((completed, wr_id_list)) => {
+            //info!("{} test completed {} {:?}", get_hostname(), completed, wr_id_list);
+            wr_id_list     
+        },
+        Err(e) => {
+            println!("Error completing: {:?}", e);
+            if let Some(wrs_debug) = &boxed_test_request.wrs_debug{
+                println!("wrs_debug {:?}", wrs_debug);
+            }
+            if let Some(nccl_metadata) = &boxed_test_request.nccl_metadata{
+                println!("nccl_metadata {:?}", nccl_metadata);
+            }
+            return 1;
+        }
+    };
+
+    for (wr_id, imm) in wr_list{
+        completion_tracker.mark_complete(wr_id);
+        let is_metadata_completion = if wr_id & (1 << 63) != 0 { true } else { false };
+        let request = request_manager.get_request(wr_id as usize).unwrap();
+        let mut request = request.lock().unwrap();
+        if is_metadata_completion{
+            request.md_completed = true;
+        } else {
+            if let RequestType::RecvData = request.request_type{
+                request.sizes = vec![imm.unwrap()];
+            }
+            request.completed = true;
+        }
+    }
+
+    //std::thread::sleep(std::time::Duration::from_millis(1));
+    
+
+
+    /*
     //std::thread::sleep(std::time::Duration::from_micros(100));
     match locked_request.request_type{
         RequestType::SendData => {
@@ -807,6 +888,7 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
             println!("{} test con_id {} available", get_hostname(), locked_request.connection_id);
         }
     }
+    */
     Box::into_raw(boxed_test_request);
     0
 }
@@ -1023,6 +1105,7 @@ pub struct NcclMetadata{
     pub nreqs: u64,
     pub idx: u64,
     pub context: u64,
+    pub md_idx: u64,
 }
 
 impl From<IbvMr> for NcclMetadata{
