@@ -26,3 +26,6 @@ log = "0.4.22"
 
 [build-dependencies]
 bindgen = "0.70.0"
+
+#[profile.release]
+#lto = true

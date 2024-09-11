@@ -1,17 +1,11 @@
 use std::{
-    ffi::{c_void, CStr},
-    fmt::{Debug, Display},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    os::{raw::c_char, unix::thread},
-    pin::Pin,
-    ptr::null_mut,
-    sync::{
-        atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering},
+    collections::HashMap, ffi::{c_void, CStr}, fmt::{Debug, Display}, net::{IpAddr, Ipv4Addr, Ipv6Addr}, os::{raw::c_char, unix::thread}, pin::Pin, ptr::null_mut, sync::{
+        atomic::{AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, Once
-    },
+    }
 };
 use ibverbs_rs::{
-    debug_wr, receiver::{Receiver, ReceiverInterface}, sender::{Sender, SenderInterface}, ControlBufferTrait, Hints, IbvAccessFlags, IbvMr, IbvQp, IbvRecvWr, IbvWcOpcode, IbvWrOpcode, LookUpBy, QpMode, SendRecv, WrsDebug, SLOT_COUNT
+    debug_wr, print_wr_ids, receiver::{Receiver, ReceiverInterface}, sender::{Sender, SenderInterface}, ControlBufferTrait, Hints, IbvAccessFlags, IbvMr, IbvQp, IbvRecvWr, IbvSendWrList, IbvWcOpcode, IbvWrOpcode, LookUpBy, QpMode, SendRecv, WrsDebug, SLOT_COUNT
 };
 use rdma_sys::*;
 use env_logger::Env;
@@ -105,6 +99,7 @@ struct Request{
     completed: bool,
     md_completed: bool,
     md_idx: u32,
+    completions: u32,
 }
 
 impl Request{
@@ -119,6 +114,7 @@ impl Request{
             completed: false,
             md_completed: false,
             md_idx: 0,
+            completions: 0,
         }
     }
     fn reset(&mut self){
@@ -129,12 +125,14 @@ impl Request{
         self.id = 0;
         self.completed = false;
         self.md_completed = false;
+        self.md_idx = 0;
+        self.completions = 0;
     }
 }
 
 impl Debug for Request{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Request {{ request_type: {:?}, connection_id: {}, stage: {:?}, idx: {}, sizes: {:?}, id: {}, completed: {}, md_completed: {} }}",
+        write!(f, "Request {{ request_type: {:?}, connection_id: {}, stage: {:?}, idx: {}, sizes: {:?}, id: {}, completed: {}, md_completed: {}, completions: {} }}",
             self.request_type,
             self.connection_id,
             self.stage,
@@ -142,7 +140,8 @@ impl Debug for Request{
             self.sizes,
             self.id,
             self.completed,
-            self.md_completed
+            self.md_completed,
+            self.completions,
         )
     }
 }
@@ -173,6 +172,20 @@ struct State{
     data_tracker: Arc<DataTracker>,
 }
 
+impl State{
+    fn new(num_qps: usize) -> Self{
+        State{
+            id: 0,
+            connection_id: 0,
+            recv_send: SendRecv::Send,
+            request_manager: RequestManager::new(),
+            metadata_allocator: Arc::new(MetadataAllocator::new()),
+            completion_tracker: Arc::new(CompletionTracker::new(num_qps)),
+            data_tracker: Arc::new(DataTracker::new()),
+        }
+    }
+}
+
 impl Debug for State{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "State {{ id: {}, connection_id: {}, recv_send: {:?} }}",
@@ -180,20 +193,6 @@ impl Debug for State{
             self.connection_id,
             self.recv_send,
         )
-    }
-}
-
-impl Default for State{
-    fn default() -> Self {
-        State{
-            id: 0,
-            connection_id: 0,
-            recv_send: SendRecv::Send,
-            request_manager: RequestManager::new(),
-            metadata_allocator: Arc::new(MetadataAllocator::new()),
-            completion_tracker: Arc::new(CompletionTracker::new()),
-            data_tracker: Arc::new(DataTracker::new()),
-        }
     }
 }
 
@@ -210,7 +209,7 @@ extern "C" fn plugin_devices(ndev: *mut c_int) -> ncclResult_t {
     0
 }
 extern "C" fn plugin_get_properties(_dev: c_int, props: *mut ncclNetProperties_v8_t) -> ncclResult_t {
-    match get_device_properties("mlx5_1".to_string()){
+    match get_device_properties("mlx5_3".to_string()){
         Ok(_props) => {
             unsafe {
                 std::ptr::write(props, _props);
@@ -225,8 +224,9 @@ extern "C" fn plugin_get_properties(_dev: c_int, props: *mut ncclNetProperties_v
 }
 extern "C" fn plugin_listen(_dev: c_int, handle: *mut c_void, listen_comm: *mut *mut c_void) -> ncclResult_t {
     let port = portpicker::pick_unused_port().unwrap();
-    let lookup_by = LookUpBy::Name("mlx5_1".to_string());
+    let lookup_by = LookUpBy::Name("mlx5_3".to_string());
     let qp_mode = QpMode::Multi;
+    let num_qps = 4;
     let mut receiver = match Receiver::new::<NcclMetadataList>(lookup_by, port, qp_mode){
         Ok(receiver) => receiver,
         Err(e) => {
@@ -265,7 +265,7 @@ extern "C" fn plugin_listen(_dev: c_int, handle: *mut c_void, listen_comm: *mut 
             *handle = netsock_handler;
         }
     }
-    let mut state = State::default();
+    let mut state = State::new(num_qps);
     state.id = rand::random::<u32>();
     state.connection_id = receiver.connection_id();
     state.recv_send = SendRecv::Recv;
@@ -281,6 +281,7 @@ extern "C" fn plugin_listen(_dev: c_int, handle: *mut c_void, listen_comm: *mut 
     0
 }
 extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *mut c_void, _send_dev_comm: *mut *mut ncclNetDeviceHandle_v8_t) -> ncclResult_t {
+    let num_qps = 4;
     let handle = handle as *mut NcclNetSocketHandle;
     let port = unsafe { (*handle).port };
     let receiver_family = unsafe { (*handle).family };
@@ -298,13 +299,13 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
             return 1;
         }
     };
-    let lookup_by = LookUpBy::Name("mlx5_1".to_string());
+    let lookup_by = LookUpBy::Name("mlx5_3".to_string());
 
     let mut sender = match Sender::new::<NcclMetadataList>(
         lookup_by,
         receiver_address,
         port,
-        1,
+        num_qps,
         ibverbs_rs::Family::Inet6,
         QpMode::Multi,
     ){
@@ -324,7 +325,7 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
         log::error!("Error connecting: {:?}", e);
         return 1;
     }
-    let mut state = State::default();
+    let mut state = State::new(num_qps as usize);
     state.id = rand::random::<u32>();
     state.connection_id = sender.connection_id();
     state.recv_send = SendRecv::Send;
@@ -436,12 +437,7 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
     };
 
     let request_manager = state.request_manager.clone();
-    let (data_request_idx, request) = if let Some((data_request_idx,_,request)) = request_manager.create_request(){
-        (data_request_idx, request)
-    } else {
-        println!("No free index found");
-        return 1;
-    };
+    let (data_request_idx, _, request) = request_manager.create_request();
     let data_tracker = state.data_tracker.clone();
     data_tracker.increment_actual_send(_size as u64);
     let completion_tracker = state.completion_tracker.clone();
@@ -462,15 +458,13 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
         std::thread::sleep(std::time::Duration::from_micros(1));
         //info!("{} isend waiting for metadata", get_hostname());
     }
-    if start_position as usize != in_nccl_metadata.md_idx as usize{
-        println!("{} isend start_position {} in_nccl_metadata.md_idx {}", get_hostname(), start_position, in_nccl_metadata.md_idx);
-    }
 
 
     let req_id = in_nccl_metadata.context;
     request_lock.id = req_id;
     let mhandle_mr = unsafe { Box::from_raw(_mhandle as *mut IbvMr) };
-    let send_wr = ibverbs_rs::IbvSendWr::new(
+
+    let send_wr_list = ibverbs_rs::IbvSendWrList::new(
         _data as u64,
         mhandle_mr.lkey(),
         in_nccl_metadata.address,
@@ -481,25 +475,28 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
         true,
         Some(data_request_idx),
         true,
+        sender.num_qps() as u64,
     );
 
-    //info!("{} isend {:?}", get_hostname(), request_lock);
-
-    let wrs_debug = debug_wr(send_wr.as_ptr());
-
-    let qp = sender.get_qp(0);
-    if let Err(e) = qp.ibv_post_send(send_wr.as_ptr()){
-        println!("{} isend post error {:?}, {:?}", get_hostname(),e, request_lock);
-        log::error!("Error posting send: {:?}", e);
-        return 1;
+    for (qp_idx, qp) in sender.qps().iter().enumerate(){
+        request_lock.completions += 1;
+        //println!("{} isend wr_id {} qpn {} {:?}", get_hostname(), data_request_idx, qp.qp_num(), request_lock);
+        completion_tracker.mark_uncomplete(data_request_idx, qp_idx);
+        let send_wr = send_wr_list.get(qp_idx).unwrap();
+        //print_wr_ids(send_wr.as_ptr());
+        if let Err(e) = qp.ibv_post_send(send_wr.as_ptr()){
+            println!("{} isend post error {:?}, {:?}", get_hostname(),e, request_lock);
+            log::error!("Error posting send: {:?}", e);
+            return 1;
+        }
     }
-    completion_tracker.mark_uncomplete(data_request_idx);
+
 
     let test_request = TestRequest{
-        qp,
+        qp_list: sender.qps(),
         request_manager: state.request_manager.clone(),
         completion_tracker: state.completion_tracker.clone(),
-        wrs_debug: Some(wrs_debug),
+        wrs_debug: None,
         nccl_metadata: Some(in_nccl_metadata.clone()),
         request_idx: data_request_idx,
         data_tracker: state.data_tracker.clone(),
@@ -544,15 +541,9 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
     };
 
     let request_manager = state.request_manager.clone();
-    let (data_request_idx, metadata_request_idx, request) = if let Some((data_request_idx,metadata_idx,request)) = request_manager.create_request(){
-        (data_request_idx, metadata_idx, request)
-    } else {
-        println!("No free index found");
-        return 1;
-    };
+    let (data_request_idx, metadata_request_idx, request) = request_manager.create_request();
 
     let data_tracker = state.data_tracker.clone();
-
 
     let mut request_lock = request.lock().unwrap();
     request_lock.request_type = RequestType::RecvData;
@@ -562,18 +553,26 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
     let metadata_allocator = state.metadata_allocator.clone();
     let start_position = metadata_allocator.allocate(n as usize);
     let completion_tracker = state.completion_tracker.clone();
-    let recv_wr = IbvRecvWr::new(None, Some(data_request_idx));
-    if let Err(e) = receiver.get_qp(0).ibv_post_recv(recv_wr){
-        println!("Error posting receive: {:?}", e);
-        return 1;
+    
+
+    for i in 0..receiver.num_qps(){
+        let recv_wr = IbvRecvWr::new(None, Some(data_request_idx));
+        if let Err(e) = receiver.get_qp(i).ibv_post_recv(recv_wr){
+            println!("Error posting receive: {:?}", e);
+            return 1;
+        }
+        request_lock.completions += 1;
+        completion_tracker.mark_uncomplete(data_request_idx, i);
     }
-    completion_tracker.mark_uncomplete(data_request_idx);
+
+
+
     let out_nccl_metadata_list = receiver.out_buffer_ptr() as *mut NcclMetadataList;
     let out_nccl_metadata_list: &mut NcclMetadataList = unsafe { &mut *out_nccl_metadata_list };
     for idx in 0..n {
         let position = start_position + idx as usize;
         let size = unsafe { * _sizes.offset(idx as isize) };
-        data_tracker.increment_expected_recv(size as u64);
+        //data_tracker.increment_expected_recv(size as u64);
         let mhandle = unsafe { *mhandles.offset(idx as isize) };
         let mhandle_mr = unsafe { Box::from_raw(mhandle as *mut IbvMr) };
         let data = unsafe { * _data.offset(idx as isize) };
@@ -602,15 +601,16 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
         Some(metadata_request_idx),
         false,
     );
+    //println!("{} irecv wr_id {} {:?}", get_hostname(),metadata_request_idx, request_lock);
     let qp = receiver.get_qp(0);
     if let Err(e) = qp.ibv_post_send(send_wr.as_ptr()){
         println!("{} plugin_irecv post error {:?}, {:?}", get_hostname(),e, request_lock);
         log::error!("Error posting send: {:?}", e);
         return 1;
     }
-    completion_tracker.mark_uncomplete(metadata_request_idx);
+    completion_tracker.mark_uncomplete(metadata_request_idx, 0);
     let test_request = TestRequest{
-        qp,
+        qp_list: receiver.qp_list(),
         request_manager: state.request_manager.clone(),
         completion_tracker: state.completion_tracker.clone(),
         wrs_debug: None,
@@ -636,259 +636,72 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
     unsafe { * _done = 0; }
     let request_idx = boxed_test_request.request_idx;
     let request_manager = boxed_test_request.request_manager.clone();
-    //let request = request_manager.get_request(request_idx as usize).unwrap();
-    //let mut locked_request = request.lock().unwrap();
-    let qp = boxed_test_request.qp.clone();
+    let qp_list = boxed_test_request.qp_list.clone();
     let completion_tracker: Arc<CompletionTracker> = boxed_test_request.completion_tracker.clone();
-    let data_tracker: Arc<DataTracker> = boxed_test_request.data_tracker.clone();
-
     {
         let request = request_manager.get_request(request_idx as usize).unwrap();
         let mut request = request.lock().unwrap();
-        //info!("{} test {:?} completed", get_hostname(), request);
-        if request.completed{
-
+        //println!("{} test {:?}", get_hostname(), request);
+        //std::thread::sleep(std::time::Duration::from_secs(1));
+        if request.completed && request.completions == 0{
             let sizes = &request.sizes;
             let mut size = 0;
             for s in sizes{
                 size += s;
             }
-            if let RequestType::RecvData = request.request_type{
-                data_tracker.increment_actual_recv(size as u64);
-                //println!("{} test expected recv data {} actual recv data {} con_id {}", get_hostname(), data_tracker.expected_recv(), data_tracker.actual_recv(), request.connection_id);
-            }
             unsafe { * _size = size as i32; }
             unsafe { * _done = 1; }
-            request_manager.complete_request(request_idx);
+            //completion_tracker.mark_complete(request_idx);
             request.reset();
             _request = null_mut();
             return 0;
         }
     }
 
-    let outstanding_completions = completion_tracker._get_num_of_combined_uncompleted_requests();
-
-    //info!("{} test outstanding completions: {}", get_hostname(), completion_tracker._get_num_of_combined_uncompleted_requests());
-    let wr_list = match qp.poll_complete(outstanding_completions as usize, IbvWcOpcode::RdmaWrite){
-        Ok((completed, wr_id_list)) => {
-            //info!("{} test completed {} {:?}", get_hostname(), completed, wr_id_list);
-            wr_id_list     
-        },
-        Err(e) => {
-            println!("Error completing: {:?}", e);
-            if let Some(wrs_debug) = &boxed_test_request.wrs_debug{
-                println!("wrs_debug {:?}", wrs_debug);
+    for (qp_idx, qp) in qp_list.iter().enumerate(){
+        let outstanding_completions = completion_tracker._get_num_of_combined_uncompleted_requests(qp_idx);
+        let (wr_list, completed) = match qp.poll_complete(outstanding_completions as usize, IbvWcOpcode::RdmaWrite){
+            Ok((completed, wr_id_list)) => {
+                (wr_id_list, completed)     
+            },
+            Err(e) => {
+                println!("Error completing: {:?}", e);
+                if let Some(wrs_debug) = &boxed_test_request.wrs_debug{
+                    println!("wrs_debug {:?}", wrs_debug);
+                }
+                if let Some(nccl_metadata) = &boxed_test_request.nccl_metadata{
+                    println!("nccl_metadata {:?}", nccl_metadata);
+                }
+                return 1;
             }
-            if let Some(nccl_metadata) = &boxed_test_request.nccl_metadata{
-                println!("nccl_metadata {:?}", nccl_metadata);
-            }
-            return 1;
-        }
-    };
+        };
+        let wr_list_clone = wr_list.clone();
+        for (wr_id, imm) in wr_list{
+            let is_metadata_completion = if wr_id & (1 << 63) != 0 { true } else { false };
+            let request = request_manager.get_request(wr_id as usize).unwrap();
+            let mut request = request.lock().unwrap();
+            if is_metadata_completion{
+                request.md_completed = true;
+                completion_tracker.mark_complete(wr_id, qp_idx);
+            } else {
+                if let RequestType::RecvData = request.request_type{
+                    request.sizes.push(imm.unwrap());
+                }
 
-    for (wr_id, imm) in wr_list{
-        completion_tracker.mark_complete(wr_id);
-        let is_metadata_completion = if wr_id & (1 << 63) != 0 { true } else { false };
-        let request = request_manager.get_request(wr_id as usize).unwrap();
-        let mut request = request.lock().unwrap();
-        if is_metadata_completion{
-            request.md_completed = true;
-        } else {
-            if let RequestType::RecvData = request.request_type{
-                request.sizes = vec![imm.unwrap()];
-            }
-            request.completed = true;
-        }
-    }
+                if request.completions > 0 {
+                    request.completions -= 1;
+                }
 
-    //std::thread::sleep(std::time::Duration::from_millis(1));
-    
+                if request.completions == 1{
 
-
-    /*
-    //std::thread::sleep(std::time::Duration::from_micros(100));
-    match locked_request.request_type{
-        RequestType::SendData => {
-            match locked_request.stage{
-                RequestStage::WaitForSendCompletion => {
-                    if locked_request.completed{
-                        locked_request.stage = RequestStage::Finished;
-                    } else {
-                        let completions = completion_tracker.get_num_of_uncompleted_data_requests();
-                        info!("{} test waiting for {} completions {:?}", get_hostname(), completions, locked_request);
-                        match qp.event_complete(completions as usize, IbvWcOpcode::RdmaWrite, None){
-                            Ok((completed, wr_id_list)) => {
-                                if completed > 0 {
-                                    for (wr_id,_imm) in wr_id_list{
-                                        if wr_id != request_idx as u64{
-                                            let req = request_manager.get_request(wr_id as usize).unwrap();
-                                            let mut req = req.lock().unwrap();
-                                            req.completed = true;
-                                        } else {
-                                            locked_request.completed = true;
-                                        }
-                                        completion_tracker.mark_complete(wr_id);
-                                    }
-                                }
-                            },
-                            Err(e) => {
-                                println!("Error completing: {:?}, request {:?}", e, locked_request);
-                                if let Some(wrs_debug) = &boxed_test_request.wrs_debug{
-                                    println!("wrs_debug {:?}", wrs_debug);
-                                }
-                                if let Some(nccl_metadata) = &boxed_test_request.nccl_metadata{
-                                    println!("nccl_metadata {:?}", nccl_metadata);
-                                }
-                                return 1;
-                            }
-                        }
-                    }
-                },
-                RequestStage::Finished => {
-                    let sizes = &locked_request.sizes;
-                    let mut size = 0;
-                    for s in sizes{
-                        size += s;
-                    }
-                    info!("{} test actual send data {} {:?}", get_hostname(), data_tracker.actual_send(), locked_request);
-                    unsafe { * _size = size as i32; }
-                    unsafe { * _done = 1; }
-                    request_manager.complete_request(request_idx);
-                    locked_request.reset();
-                    _request = null_mut();
-                    return 0;
-                },
-                _ => {
-                    println!("{} test {:?} ERROR", get_hostname(), locked_request);
+                    completion_tracker.mark_complete(wr_id, qp_idx);
+                    request.completed = true;
                 }
             }
-        },
-        RequestType::RecvData => {
-            match locked_request.stage{
-                RequestStage::SendMetadata => {
-                    if locked_request.md_completed{
-                        locked_request.stage = RequestStage::WaitForData;
-                    } else {
-                        let completions = completion_tracker.get_num_of_uncompleted_metadata_requests();
-                        info!("{} test waiting for {} completions {:?}", get_hostname(), completions, locked_request);
-                        match qp.event_complete(completions as usize, IbvWcOpcode::RdmaWrite, None){
-                            Ok((completed, wr_id_list)) => {
-                                if completed > 0 {
-                                    for (wr_id, imm) in wr_id_list{
-                                        if wr_id & (1 << 63) == 0{
-                                            //info!("{} test expected md got data", get_hostname());
-                                            if wr_id != request_idx as u64{
-                                                let req = request_manager.get_request(wr_id as usize).unwrap();
-                                                let mut req = req.lock().unwrap();
-                                                if let Some(imm) = imm{
-                                                    req.sizes = vec![imm];
-                                                } 
-                                            } else {
-                                                if let Some(imm) = imm{
-                                                    locked_request.sizes = vec![imm];
-                                                }
-                                            }
-                                            locked_request.completed = true;
-                                        } else {
-                                            let req_idx = wr_id & !(1 << 63);
-                                            if req_idx != request_idx{
-                                                let req = request_manager.get_request(req_idx as usize).unwrap();
-                                                let mut req = req.lock().unwrap();
-                                                req.md_completed = true;
-                                            } else {
-                                                locked_request.md_completed = true;
-                                            }
-                                        }
-                                        completion_tracker.mark_complete(wr_id);
-                                    }
-                                }
-                            },
-                            Err(e) => {
-                                println!("Error completing: {:?}, request {:?}", e, locked_request);
-                                return 1;
-                            }
-                        }
-                    }
-                },
-                RequestStage::WaitForData => {
-                    if locked_request.completed{
-                        locked_request.stage = RequestStage::Finished;
-                    } else {
-                        let completions = 4;
-                        info!("{} test waiting for {} completions {:?}", get_hostname(), completions, locked_request);
-                        match qp.poll_complete(completions as usize, IbvWcOpcode::RecvRdmaWithImm){
-                            Ok((completed, wr_id_list)) => {
-                                info!("{} test completed {} {:?}", get_hostname(), completed, wr_id_list);
-                                if completed > 0 {
-                                    for (wr_id, imm) in wr_id_list{
-                                        if wr_id & (1 << 63) == 0{
-                                            if wr_id != request_idx as u64{
-                                                let req = request_manager.get_request(wr_id as usize).unwrap();
-                                                let mut req = req.lock().unwrap();
-                                                req.completed = true;
-                                                if let Some(imm) = imm{
-                                                    if imm == 0 {
-                                                        info!("{} test imm 0", get_hostname());
-                                                    }
-                                                    req.sizes = vec![imm];
-                                                }
-                                            } else {
-                                                if let Some(imm) = imm{
-                                                    if imm == 0 {
-                                                        info!("{} test imm 0", get_hostname());
-                                                    }
-                                                    locked_request.sizes = vec![imm];
-                                                }
-                                                locked_request.completed = true;
-                                            }
-                                        }
-                                        else {
-                                            let req_idx = wr_id & !(1 << 63);
-                                            if req_idx != request_idx{
-                                                let req = request_manager.get_request(req_idx as usize).unwrap();
-                                                let mut req = req.lock().unwrap();
-                                                req.md_completed = true;
-                                            } else {
-                                                locked_request.md_completed = true;
-                                            }
-                                        }
-                                        completion_tracker.mark_complete(wr_id);
-                                    }
-                                }
-                            },
-                            Err(e) => {
-                                println!("Error completing: {:?}, request {:?}", e, locked_request);
-                                return 1;
-                            }
-                        }
-                    }
-                },
-                RequestStage::Finished => {
-                    let sizes = &locked_request.sizes;
-                    let mut size = 0;
-                    for s in sizes{
-                        size += s;
-                    }
-                    data_tracker.increment_actual_recv(size as u64);
-                    info!("{} test expected recv data {} actual recv data {} {:?}", get_hostname(), data_tracker.expected_recv(), data_tracker.actual_recv(), locked_request);
-                    unsafe { * _size = size as i32; }
-                    unsafe { * _done = 1; }
-                    request_manager.complete_request(request_idx);
-                    locked_request.reset();
-                    _request = null_mut();
-                    return 0;
-                    
-                },
-                _ => {
-                    println!("{} test {:?} ERROR", get_hostname(), locked_request);
-                }
-            }
-        },
-        RequestType::Available => {
-            println!("{} test con_id {} available", get_hostname(), locked_request.connection_id);
+            //println!("{} test 2 request qpn {} comp {} {} {:?} {:?}", get_hostname(), qp.qp_num(), completed, wr_id, request, wr_list_clone);
+            //std::thread::sleep(std::time::Duration::from_secs(2));
         }
     }
-    */
     Box::into_raw(boxed_test_request);
     0
 }
@@ -976,7 +789,7 @@ pub fn get_device_properties(dev_name: String) -> anyhow::Result<ncclNetProperti
             maxComms: 1024 * 1024,
             regIsGlobal: 0,
             latency: 0.0,
-            maxRecvs: 1,
+            maxRecvs: 2,
             netDeviceType: 0,
             netDeviceVersion: 0,
         };
@@ -1163,9 +976,8 @@ impl ReceiverWrapper{
 }
 struct RequestManager {
     requests: [Arc<Mutex<Request>>; MAX_REQUESTS as usize], // Array of request objects
-    data_bitmask: Arc<AtomicUsize>, // Shared atomic bitmask for concurrent access
-    metadata_bitmask: Arc<AtomicUsize>, // Shared atomic bitmask for concurrent access
     lock: Arc<Mutex<()>>,      // Mutex to synchronize between create_request and complete_request
+    index: Arc<AtomicU64>,
 }
 
 impl RequestManager {
@@ -1179,9 +991,8 @@ impl RequestManager {
 
         Arc::new(RequestManager {
             requests,
-            data_bitmask: Arc::new(AtomicUsize::new(0)),
-            metadata_bitmask: Arc::new(AtomicUsize::new(0)),
             lock: Arc::new(Mutex::new(())),
+            index: Arc::new(AtomicU64::new(0)),
         })
     }
     fn get_request(&self, idx: usize) -> Option<Arc<Mutex<Request>>> {
@@ -1190,74 +1001,38 @@ impl RequestManager {
         self.requests.get(idx).cloned()
     }
     /// Returns (data_request_id, metadata_request_id) as a tuple
-    fn create_request(&self) -> Option<(u64, u64, Arc<Mutex<Request>>)> {
+    fn create_request(&self) -> (u64, u64, Arc<Mutex<Request>>) {
         let _guard = self.lock.lock().unwrap(); // Ensure mutual exclusion
+        let current_index = self.index.load(Ordering::SeqCst);
+        let metadata_index = (current_index | (1 << 63)) as u64;
+        let request = self.requests[current_index as usize].clone();
+        
+        let next_index = (current_index + 1) % MAX_REQUESTS as u64;
+        self.index.store(next_index, Ordering::SeqCst);
 
-        // Find the next available request
-        let mut index = None;
-        for i in 0..MAX_REQUESTS {
-            let mask = 1 << i;
-            if self.data_bitmask.fetch_or(mask, Ordering::SeqCst) & mask == 0 {
-                // set metadata bit at same position in metadata bitmask
-                self.metadata_bitmask.fetch_or(mask, Ordering::SeqCst);
-                index = Some(i);
-                break;
-            }
-        }
-
-        if let Some(i) = index {
-            // Create the request IDs
-            let data_request_id = i as u64; // 64-bit request ID (array index)
-            let metadata_request_id = (i as u64) | (1 << 63); // Set MSB for metadata request
-            let request = self.requests[i as usize].clone();
-
-            // Return the request IDs
-            Some((data_request_id, metadata_request_id, request))
-        } else {
-            // Handle case where no requests are available
-            None
-        }
-    }
-
-    /// Complete the request and indicate if it is a data or metadata request
-    fn complete_request(&self, request_id: u64) {
-        let _guard = self.lock.lock().unwrap(); // Ensure mutual exclusion
-
-        // Decode the request ID to get the array index
-        let index = (request_id & !(1 << 63)) as usize; // Extract array index from request ID
-        let is_metadata = (request_id & (1 << 63)) != 0; // Check if the MSB is set
-
-        if index < MAX_REQUESTS as usize {
-            // Mark the request as complete by clearing the bit in the bitmask
-            let mask = 1 << index;
-            if is_metadata {
-                self.metadata_bitmask.fetch_and(!mask, Ordering::SeqCst);
-            } else {
-                self.data_bitmask.fetch_and(!mask, Ordering::SeqCst);
-            }
-        } else {
-            // Handle invalid request index
-            println!("Invalid request index {}", index);
-        }
+        (current_index as u64, metadata_index, request)
     }
 }
 
 
 struct CompletionTracker {
-    data_completion_bitmask: Arc<AtomicUsize>,       // Bitmask for data request completions
+    data_completion_bitmask: Vec<Arc<AtomicUsize>>,       // Bitmask for data request completions
     metadata_completion_bitmask: Arc<AtomicUsize>,   // Bitmask for metadata request completions
 }
 
 impl CompletionTracker {
-    fn new() -> Self {
+    fn new(num_qps: usize) -> Self {
+        let data_completion_bitmask = (0..num_qps)
+            .map(|_| Arc::new(AtomicUsize::new(0)))
+            .collect::<Vec<_>>();
         CompletionTracker {
-            data_completion_bitmask: Arc::new(AtomicUsize::new(0)),
+            data_completion_bitmask,
             metadata_completion_bitmask: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     /// Mark the request as complete by setting the corresponding bit in the appropriate bitmask
-    fn mark_complete(&self, request_id: u64) {
+    fn mark_complete(&self, request_id: u64, qp_id: usize) {
         let index = (request_id & !(1 << 63)) as usize; // Get the index without MSB
         let is_metadata = (request_id & (1 << 63)) != 0; // Check if MSB is set
 
@@ -1268,12 +1043,12 @@ impl CompletionTracker {
             self.metadata_completion_bitmask.fetch_and(!mask, Ordering::SeqCst);
         } else {
             // Clear the bit in the data completion bitmask
-            self.data_completion_bitmask.fetch_and(!mask, Ordering::SeqCst);
+            self.data_completion_bitmask[qp_id].fetch_and(!mask, Ordering::SeqCst);
         }
     }
 
     /// Mark the request as uncomplete by clearing the corresponding bit in the appropriate bitmask
-    fn mark_uncomplete(&self, request_id: u64) {
+    fn mark_uncomplete(&self, request_id: u64, qp_id: usize) {
         let index = (request_id & !(1 << 63)) as usize; // Get the index without MSB
         let is_metadata = (request_id & (1 << 63)) != 0; // Check if MSB is set
 
@@ -1284,12 +1059,12 @@ impl CompletionTracker {
             self.metadata_completion_bitmask.fetch_or(mask, Ordering::SeqCst);
         } else {
             // Set the bit in the data completion bitmask
-            self.data_completion_bitmask.fetch_or(mask, Ordering::SeqCst);
+            self.data_completion_bitmask[qp_id].fetch_or(mask, Ordering::SeqCst);
         }
     }
         // fn get_num_of_uncompleted_requests counts the bits set in the bitmask to determine the number of uncompleted requests.
-        fn get_num_of_uncompleted_data_requests(&self) -> usize {
-            self.data_completion_bitmask
+        fn get_num_of_uncompleted_data_requests(&self, qp_id: usize) -> usize {
+            self.data_completion_bitmask[qp_id]
                 .load(Ordering::SeqCst)
                 .count_ones() as usize
         }
@@ -1298,8 +1073,8 @@ impl CompletionTracker {
                 .load(Ordering::SeqCst)
                 .count_ones() as usize
         }
-        fn _get_num_of_combined_uncompleted_requests(&self) -> usize {
-            self.data_completion_bitmask
+        fn _get_num_of_combined_uncompleted_requests(&self, qp_id: usize) -> usize {
+            self.data_completion_bitmask[qp_id]
                 .load(Ordering::SeqCst)
                 .count_ones() as usize + self.metadata_completion_bitmask
                 .load(Ordering::SeqCst)
@@ -1376,7 +1151,7 @@ impl DataTracker {
 }
 
 struct TestRequest{
-    qp: IbvQp,
+    qp_list: Vec<IbvQp>,
     request_manager: Arc<RequestManager>,
     completion_tracker: Arc<CompletionTracker>,
     wrs_debug: Option<WrsDebug>,
