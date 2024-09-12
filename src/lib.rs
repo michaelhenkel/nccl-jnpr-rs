@@ -489,20 +489,13 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
     let in_nccl_metadata: &mut NcclMetadata = in_nccl_metadata_list.0.get_mut(start_position as usize).unwrap();
 
 
-    /*
+    
     if in_nccl_metadata.address == 0 || in_nccl_metadata.rkey == 0 {
         state.metadata_allocator.deallocate(start_position);
         unsafe { * _request = null_mut() };
         Box::into_raw(sender_receiver);
         return 0;
     }
-    */
-
-
-    while in_nccl_metadata.address == 0 || in_nccl_metadata.rkey == 0 {
-        std::thread::sleep(std::time::Duration::from_micros(1));
-    }
-    
 
     let (data_request_idx, _, request) = state.request_manager.create_request();
     let completion_tracker = state.completion_tracker.clone();
