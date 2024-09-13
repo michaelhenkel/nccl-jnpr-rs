@@ -5,14 +5,14 @@ use std::{
     }
 };
 use ibverbs_rs::{
-    receiver::{Receiver, ReceiverInterface}, sender::{Sender, SenderInterface}, ControlBufferTrait, Hints, IbvAccessFlags, IbvMr, IbvQp, IbvRecvWr, IbvWcOpcode, IbvWrOpcode, LookUpBy, QpMode, SendRecv, WrsDebug, SLOT_COUNT
+    receiver::{Receiver, ReceiverInterface}, sender::{Sender, SenderInterface}, ControlBufferTrait, Family, Hints, IbvAccessFlags, IbvMr, IbvQp, IbvRecvWr, IbvSendWr, IbvWcOpcode, IbvWrOpcode, LookUpBy, QpMode, SendRecv, WrsDebug, SLOT_COUNT
 };
 use rdma_sys::*;
 use env_logger::Env;
 mod bindings;
 use bindings::*;
 use serde::{Serialize, Deserialize};
-use log::info as rust_info;
+
 
 static INIT: Once = Once::new();
 pub fn initialize_logger() {
@@ -23,7 +23,6 @@ pub fn initialize_logger() {
 }
 
 use libc::{c_int, size_t};
-
 static mut LOG_FUNCTION: ncclDebugLogger_t = None;
 
 #[macro_export]
@@ -69,140 +68,6 @@ macro_rules! abort {
             }
         }
     }};
-}
-
-#[derive(Serialize, Deserialize, Debug, Default, Clone)]
-pub struct NcclNetSocketHandle {
-    ipv6_address: [u8; 16],
-    ipv4_address: [u8; 4],
-    family: u8,
-    port: u16,
-    stage: u8,
-}
-
-#[derive(Serialize, Deserialize, Debug, Default, Clone)]
-pub struct RemoteHandle{
-    qpn: u32,
-    gid_subnet_ids: u64,
-    gid_interface_ids: u64,
-    psn: u32,
-}
-
-#[derive(Clone)]
-struct Request{
-    request_type: RequestType,
-    connection_id: u32,
-    stage: RequestStage,
-    idx: u32,
-    sizes: Vec<u32>,
-    id: u64,
-    completed: bool,
-    md_completed: bool,
-    md_idx: u32,
-    expected_completions: u32,
-    actual_completions: u32,
-    debug: bool,
-}
-
-impl Request{
-    fn new() -> Self{
-        Request{
-            request_type: RequestType::Available,
-            connection_id: 0,
-            stage: RequestStage::SendMetadata,
-            idx: 0,
-            sizes: Vec::new(),
-            id: 0,
-            completed: false,
-            md_completed: false,
-            md_idx: 0,
-            expected_completions: 0,
-            actual_completions: 0,
-            debug: false,
-        }
-    }
-    fn reset(&mut self){
-        self.request_type = RequestType::Available;
-        self.connection_id = 0;
-        self.stage = RequestStage::SendMetadata;
-        self.sizes = Vec::new();
-        self.id = 0;
-        self.completed = false;
-        self.md_completed = false;
-        self.md_idx = 0;
-        self.expected_completions = 0;
-        self.actual_completions = 0;
-    }
-}
-
-impl Debug for Request{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Request {{ request_type: {:?}, connection_id: {}, stage: {:?}, idx: {}, sizes: {:?}, id: {}, completed: {}, md_completed: {}, compl: {}, actual_compl: {}, debug: {} }}",
-            self.request_type,
-            self.connection_id,
-            self.stage,
-            self.idx,
-            self.sizes,
-            self.id,
-            self.completed,
-            self.md_completed,
-            self.expected_completions,
-            self.actual_completions,
-            self.debug,
-        )
-    }
-}
-
-#[derive(Debug, Clone)]
-enum RequestStage{
-    SendMetadata,
-    WaitForData,
-    WaitForSendCompletion,
-    Finished,
-}
-
-#[derive(Debug, Default, Clone)]
-enum RequestType{
-    SendData,
-    RecvData,
-    #[default]
-    Available,
-}
-
-struct State{
-    id: u32,
-    connection_id: u32,
-    recv_send: SendRecv,
-    request_manager: Arc<RequestManager>,
-    metadata_allocator: Arc<MetadataAllocator>,
-    completion_tracker: Arc<CompletionTracker>,
-    data_tracker: Arc<DataTracker>,
-    debug: bool,
-}
-
-impl State{
-    fn new(num_qps: usize) -> Self{
-        State{
-            id: 0,
-            connection_id: 0,
-            recv_send: SendRecv::Send,
-            request_manager: RequestManager::new(),
-            metadata_allocator: Arc::new(MetadataAllocator::new()),
-            completion_tracker: Arc::new(CompletionTracker::new(num_qps)),
-            data_tracker: Arc::new(DataTracker::new()),
-            debug: false,
-        }
-    }
-}
-
-impl Debug for State{
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "State {{ id: {}, connection_id: {}, recv_send: {:?} }}",
-            self.id,
-            self.connection_id,
-            self.recv_send,
-        )
-    }
 }
 
 extern "C" fn plugin_init(log_function: ncclDebugLogger_t) -> ncclResult_t {
@@ -332,6 +197,34 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
             false
         }
     };
+    let mode: QpMode = match std::env::var("JNPR_NCCL_QPMODE"){
+        Ok(mode) => {
+            match mode.as_str(){
+                "multi" => QpMode::Multi,
+                "single" => QpMode::Single,
+                _ => {
+                    QpMode::Multi
+                }
+            }
+        },
+        Err(_) => {
+            QpMode::Multi
+        }
+    };
+    let family: Family = match std::env::var("JNPR_NCCL_FAMILY"){
+        Ok(family) => {
+            match family.as_str(){
+                "inet" => Family::Inet,
+                "inet6" => Family::Inet6,
+                _ => {
+                    Family::Inet6
+                }
+            }
+        },
+        Err(_) => {
+            Family::Inet6
+        }
+    };
     let handle = handle as *mut NcclNetSocketHandle;
     let port = unsafe { (*handle).port };
     let receiver_family = unsafe { (*handle).family };
@@ -356,8 +249,8 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
         receiver_address,
         port,
         num_qps as u32,
-        ibverbs_rs::Family::Inet6,
-        QpMode::Multi,
+        family,
+        mode,
     ){
         Ok(sender) => sender,
         Err(e) => {
@@ -421,7 +314,7 @@ extern "C" fn plugin_accept(listen_comm: *mut c_void, recv_comm: *mut *mut c_voi
 extern "C" fn plugin_reg_mr(coll_comm: *mut c_void, data: *mut c_void, size: size_t, _type_: c_int, mhandle: *mut *mut c_void) -> ncclResult_t {
     let access_flags = IbvAccessFlags::LocalWrite.as_i32() | IbvAccessFlags::RemoteWrite.as_i32() | IbvAccessFlags::RemoteRead.as_i32();
     let mut sender_receiver = unsafe { Box::from_raw(coll_comm as *mut SenderReceiver) };
-    let (pd, _sender_recv, state) = match *sender_receiver{
+    let (pd, _sender_recv, _state) = match *sender_receiver{
         SenderReceiver::Sender{ref mut sender, ref mut state} => {
             let sender = sender.sender();
             let sender = match sender.lock(){
@@ -473,32 +366,73 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
         log::error!("Error accepting: {:?}", "Not a sender");
         return 1;
     };
-    let sender = sender.sender();
-    let sender = match sender.lock(){
-        Ok(sender) => sender,
-        Err(poisoned) => {
-            println!("poisoned");
-            let sender = poisoned.into_inner();
-            sender
-        }
+
+    let (
+        in_buffer_ptr,
+        out_buffer_mr_addr,
+        out_buffer_mr_lkey,
+        in_remote_buffer_addr,
+        in_remote_buffer_rkey,
+        num_qps,
+        mut qp_list
+    ) = {
+        let sender = sender.sender();
+        let sender = match sender.lock(){
+            Ok(sender) => sender,
+            Err(poisoned) => {
+                println!("poisoned");
+                let sender = poisoned.into_inner();
+                sender
+            }
+        };
+        (
+            sender.in_buffer_ptr(),
+            sender.out_buffer_mr().addr(),
+            sender.out_buffer_mr().lkey(),
+            sender.in_remote_buffer_addr(),
+            sender.in_remote_buffer_rkey(),
+            sender.num_qps(),
+            sender.qps().clone()
+        )
     };
 
     let start_position = state.metadata_allocator.allocate(1);
-    let in_nccl_metadata_list = sender.in_buffer_ptr() as *mut NcclMetadataList;
+    let in_nccl_metadata_list = in_buffer_ptr as *mut NcclMetadataList;
     let in_nccl_metadata_list: &mut NcclMetadataList = unsafe { &mut *in_nccl_metadata_list };
     let in_nccl_metadata: &mut NcclMetadata = in_nccl_metadata_list.0.get_mut(start_position as usize).unwrap();
 
 
     
     if in_nccl_metadata.address == 0 || in_nccl_metadata.rkey == 0 {
+        
+        /*
+        state.retry_tracker.increment();
+        if state.retry_tracker.get() > 10000000 {
+            println!("{} plugin_isend retries exceeded", get_hostname());
+        }
+        */
+        
         state.metadata_allocator.deallocate(start_position);
         unsafe { * _request = null_mut() };
         Box::into_raw(sender_receiver);
+        //std::thread::sleep(std::time::Duration::from_millis(10));
         return 0;
     }
 
-    let (data_request_idx, _, request) = state.request_manager.create_request();
+    let (data_request_idx, _, heartbeat_idx, request) = state.request_manager.create_request();
     let completion_tracker = state.completion_tracker.clone();
+    let heartbeat_wr = ibverbs_rs::IbvSendWr::new(
+        out_buffer_mr_addr,
+        out_buffer_mr_lkey,
+        in_remote_buffer_addr,
+        in_remote_buffer_rkey,
+        0,
+        0,
+        IbvWrOpcode::RdmaWrite,
+        false,
+        Some(heartbeat_idx),
+        false,
+    );
     let mut request_lock = request.lock().unwrap();
     request_lock.idx = data_request_idx as u32;
     request_lock.request_type = RequestType::SendData;
@@ -506,8 +440,7 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
     request_lock.stage = RequestStage::WaitForSendCompletion;
     request_lock.sizes = vec![_size as u32];
     request_lock.debug = state.debug;
-
-
+    request_lock.heartbeat_wr = Some(heartbeat_wr);
 
     let req_id = in_nccl_metadata.context;
     request_lock.id = req_id;
@@ -524,29 +457,33 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
         true,
         Some(data_request_idx),
         true,
-        sender.num_qps() as u64,
+        num_qps as u64,
     );
 
 
-    for (qp_idx, qp) in sender.qps().iter().enumerate(){
+    for (qp_idx, qp) in qp_list.iter_mut().enumerate(){
         request_lock.expected_completions += 1;
         completion_tracker.mark_uncomplete(data_request_idx, qp_idx);
         let send_wr = send_wr_list.get(qp_idx).unwrap();
+        //println!("{} send post_send qp_num {}", get_hostname(), qp.qp_num());
+        //std::thread::sleep(std::time::Duration::from_millis(100));
         if let Err(e) = qp.ibv_post_send(send_wr.as_ptr()) {
             println!("{} isend post error {:?}", get_hostname(), e);
             log::error!("Error posting send: {:?}", e);
             return 1;
         }
     }
+
+
     
     let test_request = TestRequest{
-        qp_list: sender.qps(),
+        qp_list,
         request_manager: state.request_manager.clone(),
         completion_tracker: state.completion_tracker.clone(),
         wrs_debug: None,
         nccl_metadata: Some(in_nccl_metadata.clone()),
         request_idx: data_request_idx,
-        data_tracker: state.data_tracker.clone(),
+        data_tracker: None,
     };
 
     in_nccl_metadata.address = 0;
@@ -576,20 +513,50 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
         return 1;
     };
 
-    let receiver = receiver.receiver();
-    let receiver = match receiver.lock(){
-        Ok(receiver) => receiver,
-        Err(poisoned) => {
-            println!("poisoned");
-            let receiver = poisoned.into_inner();
-            receiver
-        }
+    let (
+        out_buffer_ptr,
+        out_buffer_mr_addr,
+        out_buffer_mr_lkey,
+        in_remote_buffer_addr,
+        in_remote_buffer_rkey,
+        num_qps,
+        mut qp_list,
+    ) = {
+        let receiver = receiver.receiver();
+        let receiver = match receiver.lock(){
+            Ok(receiver) => receiver,
+            Err(poisoned) => {
+                println!("poisoned");
+                let receiver = poisoned.into_inner();
+                receiver
+            }
+        };
+        (
+            receiver.out_buffer_ptr(),
+            receiver.out_buffer_mr().addr(),
+            receiver.out_buffer_mr().lkey(),
+            receiver.in_remote_buffer_addr(),
+            receiver.in_remote_buffer_rkey(),
+            receiver.num_qps(),
+            receiver.qp_list(),
+        )
     };
 
     let request_manager = state.request_manager.clone();
-    let (data_request_idx, metadata_request_idx, request) = request_manager.create_request();
+    let (data_request_idx, metadata_request_idx, heartbeat_idx, request) = request_manager.create_request();
 
-    //let data_tracker = state.data_tracker.clone();
+    let heartbeat_wr = ibverbs_rs::IbvSendWr::new(
+        out_buffer_mr_addr,
+        out_buffer_mr_lkey,
+        in_remote_buffer_addr,
+        in_remote_buffer_rkey,
+        0,
+        0,
+        IbvWrOpcode::RdmaWriteWithImm,
+        false,
+        Some(heartbeat_idx),
+        false,
+    );
 
     let mut request_lock = request.lock().unwrap();
     request_lock.request_type = RequestType::RecvData;
@@ -598,25 +565,27 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
     request_lock.idx = data_request_idx as u32;
     request_lock.id = rand::random::<u32>() as u64;
     request_lock.debug = state.debug;
+    request_lock.heartbeat_wr = Some(heartbeat_wr);
     let metadata_allocator = state.metadata_allocator.clone();
     let start_position = metadata_allocator.allocate(n as usize);
     let completion_tracker = state.completion_tracker.clone();
-    for i in 0..receiver.num_qps(){
+    for i in 0..num_qps{
         request_lock.expected_completions += 1;
+        //println!("{} irecv post_recv qp_num {}", get_hostname(), receiver.get_qp(i).qp_num());
+        //std::thread::sleep(std::time::Duration::from_millis(100));
         let recv_wr = IbvRecvWr::new(None, Some(data_request_idx));
-        if let Err(e) = receiver.get_qp(i).ibv_post_recv(recv_wr){
+        if let Err(e) = qp_list.get_mut(i).unwrap().ibv_post_recv(recv_wr){
             println!("Error posting receive: {:?}", e);
             return 1;
         }
         completion_tracker.mark_uncomplete(data_request_idx, i);
     }
 
-    let out_nccl_metadata_list = receiver.out_buffer_ptr() as *mut NcclMetadataList;
+    let out_nccl_metadata_list = out_buffer_ptr as *mut NcclMetadataList;
     let out_nccl_metadata_list: &mut NcclMetadataList = unsafe { &mut *out_nccl_metadata_list };
     for idx in 0..n {
         let position = start_position + idx as usize;
         let size = unsafe { * _sizes.offset(idx as isize) };
-        //data_tracker.increment_expected_recv(size as u64);
         let mhandle = unsafe { *mhandles.offset(idx as isize) };
         let mhandle_mr = unsafe { Box::from_raw(mhandle as *mut IbvMr) };
         let data = unsafe { * _data.offset(idx as isize) };
@@ -632,10 +601,10 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
         Box::into_raw(mhandle_mr);
     }
     let send_wr = ibverbs_rs::IbvSendWr::new(
-        receiver.out_buffer_mr().addr(),
-        receiver.out_buffer_mr().lkey(),
-        receiver.in_remote_buffer_addr(),
-        receiver.in_remote_buffer_rkey(),
+        out_buffer_mr_addr,
+        out_buffer_mr_lkey,
+        in_remote_buffer_addr,
+        in_remote_buffer_rkey,
         NcclMetadata::LEN as u64 * n as u64,
         NcclMetadata::LEN as u64 * start_position as u64,
         IbvWrOpcode::RdmaWrite,
@@ -643,21 +612,26 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
         Some(metadata_request_idx),
         false,
     );
-    let qp = receiver.get_qp(0);
-    if let Err(e) = qp.ibv_post_send(send_wr.as_ptr()){
+
+    //println!("{} irecv post_send qp_num {}", get_hostname(), qp.qp_num());
+    //std::thread::sleep(std::time::Duration::from_millis(100));
+    if let Err(e) = qp_list.get_mut(0).unwrap().ibv_post_send(send_wr.as_ptr()){
         println!("{} plugin_irecv post error {:?}, {:?}", get_hostname(),e, request_lock);
         log::error!("Error posting send: {:?}", e);
         return 1;
     }
+
+
+
     completion_tracker.mark_uncomplete(metadata_request_idx, 0);
     let test_request = TestRequest{
-        qp_list: receiver.qp_list(),
+        qp_list,
         request_manager: state.request_manager.clone(),
         completion_tracker: state.completion_tracker.clone(),
         wrs_debug: None,
         nccl_metadata: None,
         request_idx: data_request_idx,
-        data_tracker: state.data_tracker.clone(),
+        data_tracker: None,
     };
     let test_request_box = Box::new(test_request);
     let test_request_ptr: *mut TestRequest = Box::into_raw(test_request_box);
@@ -671,9 +645,8 @@ extern "C" fn plugin_iflush(_recv_comm: *mut c_void, _n: c_int, _data: *mut *mut
     0
 }
 extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *mut c_int) -> ncclResult_t {
-    //println!("{} plugin_test", get_hostname());
     let test_request_ptr = _request as *mut TestRequest;
-    let boxed_test_request = unsafe { Box::from_raw(test_request_ptr) };
+    let mut boxed_test_request = unsafe { Box::from_raw(test_request_ptr) };
     unsafe { * _done = 0; }
     let completion_tracker: Arc<CompletionTracker> = boxed_test_request.completion_tracker.clone();
     {
@@ -690,10 +663,12 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
             request.reset();
             _request = null_mut();
             return 0;
+        } else {
+            request.retries += 1;
         }
     }
 
-    for (qp_idx, qp) in boxed_test_request.qp_list.iter().enumerate(){
+    for (qp_idx, qp) in boxed_test_request.qp_list.iter_mut().enumerate(){
         let outstanding_completions = completion_tracker._get_num_of_combined_uncompleted_requests(qp_idx);
         let (wr_list, _completed) = match qp.poll_complete(outstanding_completions as usize, IbvWcOpcode::RdmaWrite){
             Ok((completed, wr_id_list)) => {
@@ -711,6 +686,7 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
             }
         };
         for (wr_id, imm) in wr_list{
+            if wr_id & (1 << 62) != 0 { continue; };
             let is_metadata_completion = if wr_id & (1 << 63) != 0 { true } else { false };
             let request = boxed_test_request.request_manager.get_request(wr_id as usize).unwrap();
             let mut request = request.lock().unwrap();
@@ -729,7 +705,22 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
                     request.completed = true;
                 }
             }
+            /*
+            if request.retries > 500{
+                println!("{} test retries exceeded", get_hostname());
+                match qp.ibv_post_send(request.heartbeat_wr.as_ref().unwrap().as_ptr()){
+                    Ok(_) => {
+                        println!("{} test heartbeat sent qp_num {} qp_state {}", get_hostname(), qp.qp_num(), qp.state().unwrap());
+                        request.retries = 0;
+                    },
+                    Err(e) => {
+                        println!("Error posting heartbeat: {:?}", e);
+                    }
+                }
+            }
+            */
         }
+
     }
     Box::into_raw(boxed_test_request);
     0
@@ -773,7 +764,6 @@ pub static ncclNetPlugin_v8: ncclNet_v8_t = ncclNet_v8_t {
     irecvConsumed: Some(plugin_irecv_consumed),
 };
 
-
 fn get_hostname() -> String {
     let hostname = hostname::get().unwrap();
     hostname.into_string().unwrap()
@@ -805,8 +795,6 @@ pub fn get_device_properties(dev_name: String) -> anyhow::Result<ncclNetProperti
             return Err(CustomError::new("Failed to query device".to_string(), ret));
         }
         let pci_path = format!("/sys/class/infiniband/{}/device", device_name.to_str().unwrap());
-        // The speed field indicates the speed of the network port in Mbps (10^6 bits per second)
-        // 400 gbps
         let speed = 400000;
         let props = ncclNetProperties_v8_t{
             name: device_name.as_ptr() as *mut i8,
@@ -1003,9 +991,95 @@ impl ReceiverWrapper{
         self.0.clone()
     }
 }
+
+
+struct Request{
+    request_type: RequestType,
+    connection_id: u32,
+    stage: RequestStage,
+    idx: u32,
+    sizes: Vec<u32>,
+    id: u64,
+    completed: bool,
+    md_completed: bool,
+    md_idx: u32,
+    expected_completions: u32,
+    actual_completions: u32,
+    debug: bool,
+    heartbeat_wr: Option<IbvSendWr>,
+    retries: u32,
+}
+
+impl Request{
+    fn new() -> Self{
+        Request{
+            request_type: RequestType::Available,
+            connection_id: 0,
+            stage: RequestStage::SendMetadata,
+            idx: 0,
+            sizes: Vec::new(),
+            id: 0,
+            completed: false,
+            md_completed: false,
+            md_idx: 0,
+            expected_completions: 0,
+            actual_completions: 0,
+            debug: false,
+            heartbeat_wr: None,
+            retries: 0,
+        }
+    }
+    fn reset(&mut self){
+        self.request_type = RequestType::Available;
+        self.connection_id = 0;
+        self.stage = RequestStage::SendMetadata;
+        self.sizes = Vec::new();
+        self.id = 0;
+        self.completed = false;
+        self.md_completed = false;
+        self.md_idx = 0;
+        self.expected_completions = 0;
+        self.actual_completions = 0;
+    }
+}
+
+impl Debug for Request{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Request {{ request_type: {:?}, connection_id: {}, stage: {:?}, idx: {}, sizes: {:?}, id: {}, completed: {}, md_completed: {}, compl: {}, actual_compl: {}, debug: {}, retries: {} }}",
+            self.request_type,
+            self.connection_id,
+            self.stage,
+            self.idx,
+            self.sizes,
+            self.id,
+            self.completed,
+            self.md_completed,
+            self.expected_completions,
+            self.actual_completions,
+            self.debug,
+            self.retries,
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+enum RequestStage{
+    SendMetadata,
+    WaitForData,
+    WaitForSendCompletion,
+}
+
+#[derive(Debug, Default, Clone)]
+enum RequestType{
+    SendData,
+    RecvData,
+    #[default]
+    Available,
+}
+
 struct RequestManager {
-    requests: [Arc<Mutex<Request>>; MAX_REQUESTS as usize], // Array of request objects
-    lock: Arc<Mutex<()>>,      // Mutex to synchronize between create_request and complete_request
+    requests: [Arc<Mutex<Request>>; MAX_REQUESTS as usize],
+    lock: Arc<Mutex<()>>,
     index: Arc<AtomicU64>,
 }
 
@@ -1030,23 +1104,44 @@ impl RequestManager {
         self.requests.get(idx).cloned()
     }
     /// Returns (data_request_id, metadata_request_id) as a tuple
-    fn create_request(&self) -> (u64, u64, Arc<Mutex<Request>>) {
+    fn create_request(&self) -> (u64, u64, u64, Arc<Mutex<Request>>) {
         let _guard = self.lock.lock().unwrap(); // Ensure mutual exclusion
         let current_index = self.index.load(Ordering::SeqCst);
         let metadata_index = (current_index | (1 << 63)) as u64;
+        let heartbeat_index = (current_index | (1 << 62)) as u64;
         let request = self.requests[current_index as usize].clone();
         
         let next_index = (current_index + 1) % MAX_REQUESTS as u64;
         self.index.store(next_index, Ordering::SeqCst);
 
-        (current_index as u64, metadata_index, request)
+        (current_index as u64, metadata_index, heartbeat_index, request)
     }
 }
 
+struct RetryTracker {
+    retries: Arc<AtomicUsize>,
+}
+impl RetryTracker{
+    fn new() -> Self {
+        RetryTracker{
+            retries: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+    fn increment(&self){
+        self.retries.fetch_add(1, Ordering::SeqCst);
+    }
+    fn get(&self) -> usize {
+        self.retries.load(Ordering::SeqCst)
+    }
+    fn reset(&self){
+        self.retries.store(0, Ordering::SeqCst);
+    }
+}
 
 struct CompletionTracker {
     data_completion_bitmask: Vec<Arc<AtomicUsize>>,       // Bitmask for data request completions
     metadata_completion_bitmask: Arc<AtomicUsize>,   // Bitmask for metadata request completions
+    heartbeat_completion_bitmask: Arc<AtomicUsize>,  // Bitmask for heartbeat request completions
 }
 
 impl CompletionTracker {
@@ -1057,6 +1152,7 @@ impl CompletionTracker {
         CompletionTracker {
             data_completion_bitmask,
             metadata_completion_bitmask: Arc::new(AtomicUsize::new(0)),
+            heartbeat_completion_bitmask: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -1064,12 +1160,16 @@ impl CompletionTracker {
     fn mark_complete(&self, request_id: u64, qp_id: usize) {
         let index = (request_id & !(1 << 63)) as usize; // Get the index without MSB
         let is_metadata = (request_id & (1 << 63)) != 0; // Check if MSB is set
+        let is_heartbeat = (request_id & (1 << 62)) != 0; // Check if 2nd MSB is set
 
         let mask = 1 << index;
 
         if is_metadata {
             // Clear the bit in the metadata completion bitmask
             self.metadata_completion_bitmask.fetch_and(!mask, Ordering::SeqCst);
+        } else if is_heartbeat{
+            // Clear the bit in the heartbeat completion bitmask
+            self.heartbeat_completion_bitmask.fetch_and(!mask, Ordering::SeqCst);
         } else {
             // Clear the bit in the data completion bitmask
             self.data_completion_bitmask[qp_id].fetch_and(!mask, Ordering::SeqCst);
@@ -1080,35 +1180,30 @@ impl CompletionTracker {
     fn mark_uncomplete(&self, request_id: u64, qp_id: usize) {
         let index = (request_id & !(1 << 63)) as usize; // Get the index without MSB
         let is_metadata = (request_id & (1 << 63)) != 0; // Check if MSB is set
+        let is_heartbeat = (request_id & (1 << 62)) != 0; // Check if 2nd MSB is set
 
         let mask = 1 << index;
 
         if is_metadata {
             // Set the bit in the metadata completion bitmask
             self.metadata_completion_bitmask.fetch_or(mask, Ordering::SeqCst);
+        } else if is_heartbeat{
+            // Set the bit in the heartbeat completion bitmask
+            self.heartbeat_completion_bitmask.fetch_or(mask, Ordering::SeqCst);
         } else {
             // Set the bit in the data completion bitmask
             self.data_completion_bitmask[qp_id].fetch_or(mask, Ordering::SeqCst);
         }
     }
-        // fn get_num_of_uncompleted_requests counts the bits set in the bitmask to determine the number of uncompleted requests.
-        fn get_num_of_uncompleted_data_requests(&self, qp_id: usize) -> usize {
-            self.data_completion_bitmask[qp_id]
-                .load(Ordering::SeqCst)
-                .count_ones() as usize
-        }
-        fn get_num_of_uncompleted_metadata_requests(&self) -> usize {
-            self.metadata_completion_bitmask
-                .load(Ordering::SeqCst)
-                .count_ones() as usize
-        }
-        fn _get_num_of_combined_uncompleted_requests(&self, qp_id: usize) -> usize {
-            self.data_completion_bitmask[qp_id]
-                .load(Ordering::SeqCst)
-                .count_ones() as usize + self.metadata_completion_bitmask
-                .load(Ordering::SeqCst)
-                .count_ones() as usize
-        }
+    fn _get_num_of_combined_uncompleted_requests(&self, qp_id: usize) -> usize {
+        self.data_completion_bitmask[qp_id]
+            .load(Ordering::SeqCst)
+            .count_ones() as usize + self.metadata_completion_bitmask
+            .load(Ordering::SeqCst)
+            .count_ones() as usize + self.heartbeat_completion_bitmask
+            .load(Ordering::SeqCst)
+            .count_ones() as usize
+    }
 }
 
 
@@ -1148,6 +1243,7 @@ struct DataTracker {
     actual_send: Arc<AtomicU64>   // Actual amount of data sent
 }
 
+#[allow(dead_code)]
 impl DataTracker {
     fn new() -> Self {
         DataTracker {
@@ -1182,6 +1278,7 @@ impl DataTracker {
     }
 }
 
+#[allow(dead_code)]
 struct TestRequest{
     qp_list: Vec<IbvQp>,
     request_manager: Arc<RequestManager>,
@@ -1189,5 +1286,62 @@ struct TestRequest{
     wrs_debug: Option<WrsDebug>,
     nccl_metadata: Option<NcclMetadata>,
     request_idx: u64,
+    data_tracker: Option<Arc<DataTracker>>,
+}
+
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+pub struct NcclNetSocketHandle {
+    ipv6_address: [u8; 16],
+    ipv4_address: [u8; 4],
+    family: u8,
+    port: u16,
+    stage: u8,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+pub struct RemoteHandle{
+    qpn: u32,
+    gid_subnet_ids: u64,
+    gid_interface_ids: u64,
+    psn: u32,
+}
+
+#[allow(dead_code)]
+struct State{
+    id: u32,
+    connection_id: u32,
+    recv_send: SendRecv,
+    request_manager: Arc<RequestManager>,
+    metadata_allocator: Arc<MetadataAllocator>,
+    completion_tracker: Arc<CompletionTracker>,
     data_tracker: Arc<DataTracker>,
+    retry_tracker: Arc<RetryTracker>,
+    debug: bool,
+    retries: u32,
+}
+impl State{
+    fn new(num_qps: usize) -> Self{
+        State{
+            id: 0,
+            connection_id: 0,
+            recv_send: SendRecv::Send,
+            request_manager: RequestManager::new(),
+            metadata_allocator: Arc::new(MetadataAllocator::new()),
+            completion_tracker: Arc::new(CompletionTracker::new(num_qps)),
+            data_tracker: Arc::new(DataTracker::new()),
+            retry_tracker: Arc::new(RetryTracker::new()),
+            debug: false,
+            retries: 0,
+        }
+    }
+}
+impl Debug for State{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "State {{ id: {}, connection_id: {}, recv_send: {:?} }}",
+            self.id,
+            self.connection_id,
+            self.recv_send,
+        )
+    }
 }

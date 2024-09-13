@@ -1,9 +1,9 @@
 extern crate bindgen;
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
 use std::path::PathBuf;
 
-fn main() {
+fn main() -> io::Result<()>{
     // Specify the header file you want to generate bindings for
     let header_file = "nccl/nccl_net_v8.h";
 
@@ -23,15 +23,22 @@ fn main() {
     // out path is src/bindings/
     let out_path = PathBuf::from("src/bindings/");
     let bindings_path = out_path.join("bindings.rs");
-    bindings
-        .write_to_file(bindings_path.clone())
-        .expect("Couldn't write bindings!");
+    let mut file = File::create(&bindings_path)?;
+    writeln!(file, "#![allow(non_camel_case_types)]")?;
+    writeln!(file, "#![allow(non_upper_case_globals)]")?;
+    writeln!(file, "#![allow(non_snake_case)]")?;
+    writeln!(file, "#![allow(dead_code)]")?;
+    
+    // Write the bindings to the file
+    file.write_all(bindings.to_string().as_bytes())?;
 
+    // Open the file for appending and add the unsafe impls
     let mut file = OpenOptions::new()
-    .append(true)
-    .open(&bindings_path)
-    .expect("Couldn't open bindings file for appending");
+        .append(true)
+        .open(&bindings_path)
+        .expect("Couldn't open bindings file for appending");
 
-    writeln!(file, "unsafe impl Send for ncclNet_v8_t {{}}").unwrap();
-    writeln!(file, "unsafe impl Sync for ncclNet_v8_t {{}}").unwrap();
+    writeln!(file, "unsafe impl Send for ncclNet_v8_t {{}}")?;
+    writeln!(file, "unsafe impl Sync for ncclNet_v8_t {{}}")?;
+    Ok(())
 }
