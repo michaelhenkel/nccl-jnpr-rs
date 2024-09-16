@@ -1,7 +1,7 @@
 use std::{
     ffi::{c_void, CStr}, fmt::{Debug, Display}, net::{IpAddr, Ipv4Addr, Ipv6Addr}, os::raw::c_char, pin::Pin, ptr::null_mut, sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc, Mutex, Once
+        Arc, Mutex, Once, RwLock
     }
 };
 use ibverbs_rs::{
@@ -118,7 +118,6 @@ extern "C" fn plugin_listen(_dev: c_int, handle: *mut c_void, listen_comm: *mut 
             false
         }
     };
-
     let port = portpicker::pick_unused_port().unwrap();
     let lookup_by = LookUpBy::Name(dev);
     let qp_mode = QpMode::Multi;
@@ -243,7 +242,6 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
         }
     };
     let lookup_by = LookUpBy::Name(dev);
-
     let mut sender = match Sender::new::<NcclMetadataList>(
         lookup_by,
         receiver_address,
@@ -258,12 +256,10 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
             return 1;
         }
     };
-
     if let Err(e) = sender.create_control_buffer(){
         log::error!("Error creating metadata: {:?}", e);
         return 1;
     }
-    
     if let Err(e) = sender.connect(){
         log::error!("Error connecting: {:?}", e);
         return 1;
@@ -287,7 +283,7 @@ extern "C" fn plugin_accept(listen_comm: *mut c_void, recv_comm: *mut *mut c_voi
     let mut sender_receiver = unsafe { Box::from_raw(listen_comm as *mut SenderReceiver) };
     if let SenderReceiver::Receiver{ref mut receiver, state: _} = *sender_receiver{
         let receiver = receiver.receiver();
-        let mut receiver = match receiver.lock(){
+        let mut receiver = match receiver.write(){
             Ok(receiver) => receiver,
             Err(poisoned) => {
                 println!("poisoned");
@@ -295,7 +291,6 @@ extern "C" fn plugin_accept(listen_comm: *mut c_void, recv_comm: *mut *mut c_voi
                 receiver
             }
         };
-        
         if let Err(e) = receiver.accept(){
             log::error!("Error accepting: {:?}", e);
             return 1;
@@ -308,7 +303,6 @@ extern "C" fn plugin_accept(listen_comm: *mut c_void, recv_comm: *mut *mut c_voi
         log::error!("Error accepting: {:?}", "Not a receiver");
         return 1;
     }
-
     0
 }
 extern "C" fn plugin_reg_mr(coll_comm: *mut c_void, data: *mut c_void, size: size_t, _type_: c_int, mhandle: *mut *mut c_void) -> ncclResult_t {
@@ -317,7 +311,7 @@ extern "C" fn plugin_reg_mr(coll_comm: *mut c_void, data: *mut c_void, size: siz
     let (pd, _sender_recv, _state) = match *sender_receiver{
         SenderReceiver::Sender{ref mut sender, ref mut state} => {
             let sender = sender.sender();
-            let sender = match sender.lock(){
+            let sender = match sender.write(){
                 Ok(sender) => sender,
                 Err(poisoned) => {
                     println!("poisoned");
@@ -326,12 +320,10 @@ extern "C" fn plugin_reg_mr(coll_comm: *mut c_void, data: *mut c_void, size: siz
                 }
             };
             (sender.pd(), "sender".to_string(), state)
-
         },
         SenderReceiver::Receiver{ref mut receiver, ref mut state} => {
-
             let receiver = receiver.receiver();
-            let receiver = match receiver.lock(){
+            let receiver = match receiver.write(){
                 Ok(receiver) => receiver,
                 Err(poisoned) => {
                     println!("poisoned");
@@ -339,7 +331,6 @@ extern "C" fn plugin_reg_mr(coll_comm: *mut c_void, data: *mut c_void, size: siz
                     receiver
                 }
             };
-
             (receiver.pd(), "recv".to_string(), state)
         }
     };
@@ -377,7 +368,7 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
         mut qp_list
     ) = {
         let sender = sender.sender();
-        let sender = match sender.lock(){
+        let sender = match sender.read(){
             Ok(sender) => sender,
             Err(poisoned) => {
                 println!("poisoned");
@@ -401,21 +392,10 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
     let in_nccl_metadata_list: &mut NcclMetadataList = unsafe { &mut *in_nccl_metadata_list };
     let in_nccl_metadata: &mut NcclMetadata = in_nccl_metadata_list.0.get_mut(start_position as usize).unwrap();
 
-
-    
     if in_nccl_metadata.address == 0 || in_nccl_metadata.rkey == 0 {
-        
-        /*
-        state.retry_tracker.increment();
-        if state.retry_tracker.get() > 10000000 {
-            println!("{} plugin_isend retries exceeded", get_hostname());
-        }
-        */
-        
         state.metadata_allocator.deallocate(start_position);
         unsafe { * _request = null_mut() };
         Box::into_raw(sender_receiver);
-        //std::thread::sleep(std::time::Duration::from_millis(10));
         return 0;
     }
 
@@ -460,13 +440,10 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
         num_qps as u64,
     );
 
-
     for (qp_idx, qp) in qp_list.iter_mut().enumerate(){
         request_lock.expected_completions += 1;
         completion_tracker.mark_uncomplete(data_request_idx, qp_idx);
         let send_wr = send_wr_list.get(qp_idx).unwrap();
-        //println!("{} send post_send qp_num {}", get_hostname(), qp.qp_num());
-        //std::thread::sleep(std::time::Duration::from_millis(100));
         if let Err(e) = qp.ibv_post_send(send_wr.as_ptr()) {
             println!("{} isend post error {:?}", get_hostname(), e);
             log::error!("Error posting send: {:?}", e);
@@ -474,8 +451,6 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
         }
     }
 
-
-    
     let test_request = TestRequest{
         qp_list,
         request_manager: state.request_manager.clone(),
@@ -523,7 +498,7 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
         mut qp_list,
     ) = {
         let receiver = receiver.receiver();
-        let receiver = match receiver.lock(){
+        let receiver = match receiver.read(){
             Ok(receiver) => receiver,
             Err(poisoned) => {
                 println!("poisoned");
@@ -544,7 +519,6 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
 
     let request_manager = state.request_manager.clone();
     let (data_request_idx, metadata_request_idx, heartbeat_idx, request) = request_manager.create_request();
-
     let heartbeat_wr = ibverbs_rs::IbvSendWr::new(
         out_buffer_mr_addr,
         out_buffer_mr_lkey,
@@ -571,8 +545,6 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
     let completion_tracker = state.completion_tracker.clone();
     for i in 0..num_qps{
         request_lock.expected_completions += 1;
-        //println!("{} irecv post_recv qp_num {}", get_hostname(), receiver.get_qp(i).qp_num());
-        //std::thread::sleep(std::time::Duration::from_millis(100));
         let recv_wr = IbvRecvWr::new(None, Some(data_request_idx));
         if let Err(e) = qp_list.get_mut(i).unwrap().ibv_post_recv(recv_wr){
             println!("Error posting receive: {:?}", e);
@@ -580,7 +552,6 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
         }
         completion_tracker.mark_uncomplete(data_request_idx, i);
     }
-
     let out_nccl_metadata_list = out_buffer_ptr as *mut NcclMetadataList;
     let out_nccl_metadata_list: &mut NcclMetadataList = unsafe { &mut *out_nccl_metadata_list };
     for idx in 0..n {
@@ -613,15 +584,11 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
         false,
     );
 
-    //println!("{} irecv post_send qp_num {}", get_hostname(), qp.qp_num());
-    //std::thread::sleep(std::time::Duration::from_millis(100));
     if let Err(e) = qp_list.get_mut(0).unwrap().ibv_post_send(send_wr.as_ptr()){
         println!("{} plugin_irecv post error {:?}, {:?}", get_hostname(),e, request_lock);
         log::error!("Error posting send: {:?}", e);
         return 1;
     }
-
-
 
     completion_tracker.mark_uncomplete(metadata_request_idx, 0);
     let test_request = TestRequest{
@@ -663,11 +630,8 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
             request.reset();
             _request = null_mut();
             return 0;
-        } else {
-            request.retries += 1;
         }
     }
-
     for (qp_idx, qp) in boxed_test_request.qp_list.iter_mut().enumerate(){
         let outstanding_completions = completion_tracker._get_num_of_combined_uncompleted_requests(qp_idx);
         let (wr_list, _completed) = match qp.poll_complete(outstanding_completions as usize, IbvWcOpcode::RdmaWrite){
@@ -705,22 +669,7 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
                     request.completed = true;
                 }
             }
-            /*
-            if request.retries > 500{
-                println!("{} test retries exceeded", get_hostname());
-                match qp.ibv_post_send(request.heartbeat_wr.as_ref().unwrap().as_ptr()){
-                    Ok(_) => {
-                        println!("{} test heartbeat sent qp_num {} qp_state {}", get_hostname(), qp.qp_num(), qp.state().unwrap());
-                        request.retries = 0;
-                    },
-                    Err(e) => {
-                        println!("Error posting heartbeat: {:?}", e);
-                    }
-                }
-            }
-            */
         }
-
     }
     Box::into_raw(boxed_test_request);
     0
@@ -806,7 +755,7 @@ pub fn get_device_properties(dev_name: String) -> anyhow::Result<ncclNetProperti
             maxComms: 1024 * 1024,
             regIsGlobal: 0,
             latency: 0.0,
-            maxRecvs: 1,
+            maxRecvs: 8,
             netDeviceType: 0,
             netDeviceVersion: 0,
         };
@@ -971,27 +920,26 @@ enum SenderReceiver{
     }
 }
 
-struct SenderWrapper(Arc<Mutex<Box<dyn SenderInterface>>>);
+struct SenderWrapper(Arc<RwLock<Box<dyn SenderInterface>>>);
 
 impl SenderWrapper{
     fn new(sender: Box<dyn SenderInterface>) -> Self {
-        SenderWrapper(Arc::new(Mutex::new(sender)))
+        SenderWrapper(Arc::new(RwLock::new(sender)))
     }
-    fn sender(&self) -> Arc<Mutex<Box<dyn SenderInterface>>> {
+    fn sender(&self) -> Arc<RwLock<Box<dyn SenderInterface>>> {
         self.0.clone()
     }
 }
-struct ReceiverWrapper(Arc<Mutex<Box<dyn ReceiverInterface>>>);
+struct ReceiverWrapper(Arc<RwLock<Box<dyn ReceiverInterface>>>);
 
 impl ReceiverWrapper{
     fn new(receiver: Box<dyn ReceiverInterface>) -> Self {
-        ReceiverWrapper(Arc::new(Mutex::new(receiver)))
+        ReceiverWrapper(Arc::new(RwLock::new(receiver)))
     }
-    fn receiver(&self) -> Arc<Mutex<Box<dyn ReceiverInterface>>> {
+    fn receiver(&self) -> Arc<RwLock<Box<dyn ReceiverInterface>>> {
         self.0.clone()
     }
 }
-
 
 struct Request{
     request_type: RequestType,
@@ -1085,12 +1033,11 @@ struct RequestManager {
 
 impl RequestManager {
     fn new() -> Arc<Self> {
-        // Initialize requests array and other fields
         let requests = (0..MAX_REQUESTS)
             .map(|_| Arc::new(Mutex::new(Request::new())))
             .collect::<Vec<_>>()
             .try_into()
-            .unwrap(); // Ensure array size matches MAX_REQUESTS
+            .unwrap();
 
         Arc::new(RequestManager {
             requests,
@@ -1099,21 +1046,17 @@ impl RequestManager {
         })
     }
     fn get_request(&self, idx: usize) -> Option<Arc<Mutex<Request>>> {
-        // remove MSB to get the actual index
         let idx = idx & !(1 << 63);
         self.requests.get(idx).cloned()
     }
-    /// Returns (data_request_id, metadata_request_id) as a tuple
     fn create_request(&self) -> (u64, u64, u64, Arc<Mutex<Request>>) {
         let _guard = self.lock.lock().unwrap(); // Ensure mutual exclusion
         let current_index = self.index.load(Ordering::SeqCst);
         let metadata_index = (current_index | (1 << 63)) as u64;
         let heartbeat_index = (current_index | (1 << 62)) as u64;
         let request = self.requests[current_index as usize].clone();
-        
         let next_index = (current_index + 1) % MAX_REQUESTS as u64;
         self.index.store(next_index, Ordering::SeqCst);
-
         (current_index as u64, metadata_index, heartbeat_index, request)
     }
 }
