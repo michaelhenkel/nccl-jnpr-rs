@@ -21,7 +21,8 @@ portpicker = "0.1.1"
 rand = "0.8.5"
 rdma-sys = "0.3.0"
 serde = { version = "1.0.209", features = ["derive", "serde_derive"] }
-ibverbs-rs = { path = "../ibverbs-rs" }
+# ibverbs uses branch v2
+ibverbs-rs = { git = "https://github.com/michaelhenkel/ibverbs-rs", branch = "v2" }
 log = "0.4.22"
 
 [build-dependencies]
