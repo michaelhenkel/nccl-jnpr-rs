@@ -1,6 +1,6 @@
 use std::{
     ffi::{c_void, CStr}, fmt::{Debug, Display}, net::{IpAddr, Ipv4Addr, Ipv6Addr}, os::raw::c_char, pin::Pin, ptr::null_mut, sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, Once, RwLock
     }
 };
@@ -78,12 +78,38 @@ extern "C" fn plugin_init(log_function: ncclDebugLogger_t) -> ncclResult_t {
     0
 }
 extern "C" fn plugin_devices(ndev: *mut c_int) -> ncclResult_t {
-    unsafe { ndev.write(1) };
+    let filter = match std::env::var("JNPR_NCCL_DEV_FILTER"){
+        Ok(filter) => {
+            filter.split(",").map(|s| s.to_string()).collect::<Vec<String>>()
+        },
+        Err(_) => {
+            log::error!("Error getting device: {:?}", "JNPR_NCCL_DEV_FILTER not set");
+            return 1;
+        }
+    };
+    let num_devices = match get_devices(filter){
+        Ok(num_devices) => num_devices,
+        Err(e) => {
+            log::error!("Error getting devices: {:?}", e);
+            return 1;
+        }
+    };
+    unsafe { ndev.write(num_devices as i32) };
     
     0
 }
 extern "C" fn plugin_get_properties(_dev: c_int, props: *mut ncclNetProperties_v8_t) -> ncclResult_t {
-    match get_device_properties("mlx5_3".to_string()){
+    let filter = match std::env::var("JNPR_NCCL_DEV_FILTER"){
+        Ok(filter) => {
+            filter.split(",").map(|s| s.to_string()).collect::<Vec<String>>()
+        },
+        Err(_) => {
+            log::error!("Error getting device: {:?}", "JNPR_NCCL_DEV_FILTER not set");
+            return 1;
+        }
+    };
+    let device = filter.get(_dev as usize).unwrap();
+    match get_device_properties(device.to_string()){
         Ok(_props) => {
             unsafe {
                 std::ptr::write(props, _props);
@@ -95,16 +121,20 @@ extern "C" fn plugin_get_properties(_dev: c_int, props: *mut ncclNetProperties_v
             return e.code().try_into().unwrap();
         }
     }
+
+
 }
 extern "C" fn plugin_listen(_dev: c_int, handle: *mut c_void, listen_comm: *mut *mut c_void) -> ncclResult_t {
-
-    let dev = match std::env::var("JNPR_NCCL_DEV"){
-        Ok(dev) => dev,
+    let filter = match std::env::var("JNPR_NCCL_DEV_FILTER"){
+        Ok(filter) => {
+            filter.split(",").map(|s| s.to_string()).collect::<Vec<String>>()
+        },
         Err(_) => {
-            log::error!("Error getting device: {:?}", "JNPR_NCCL_DEV not set");
+            log::error!("Error getting device: {:?}", "JNPR_NCCL_DEV_FILTER not set");
             return 1;
         }
     };
+    let dev = filter.get(_dev as usize).unwrap();
     let num_qps = match std::env::var("JNPR_NCCL_NUM_QPS"){
         Ok(num_qps) => num_qps.parse::<usize>().unwrap(),
         Err(_) => {
@@ -119,9 +149,11 @@ extern "C" fn plugin_listen(_dev: c_int, handle: *mut c_void, listen_comm: *mut 
         }
     };
     let port = portpicker::pick_unused_port().unwrap();
-    let lookup_by = LookUpBy::Name(dev);
+    let lookup_by = LookUpBy::Name(dev.to_string());
     let qp_mode = QpMode::Multi;
-    let mut receiver = match Receiver::new::<NcclMetadataList>(lookup_by, port, qp_mode){
+    // 200Gbps in kbps
+    let rate_limit = Some(100000000);
+    let mut receiver = match Receiver::new::<NcclMetadataList>(lookup_by, port, qp_mode, rate_limit){
         Ok(receiver) => receiver,
         Err(e) => {
             log::error!("Error creating receiver: {:?}", e);
@@ -176,13 +208,16 @@ extern "C" fn plugin_listen(_dev: c_int, handle: *mut c_void, listen_comm: *mut 
     0
 }
 extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *mut c_void, _send_dev_comm: *mut *mut ncclNetDeviceHandle_v8_t) -> ncclResult_t {
-    let dev = match std::env::var("JNPR_NCCL_DEV"){
-        Ok(dev) => dev,
+    let filter = match std::env::var("JNPR_NCCL_DEV_FILTER"){
+        Ok(filter) => {
+            filter.split(",").map(|s| s.to_string()).collect::<Vec<String>>()
+        },
         Err(_) => {
-            log::error!("Error getting device: {:?}", "JNPR_NCCL_DEV not set");
+            log::error!("Error getting device: {:?}", "JNPR_NCCL_DEV_FILTER not set");
             return 1;
         }
     };
+    let dev = filter.get(_dev as usize).unwrap();
     let num_qps = match std::env::var("JNPR_NCCL_NUM_QPS"){
         Ok(num_qps) => num_qps.parse::<usize>().unwrap(),
         Err(_) => {
@@ -241,7 +276,8 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
             return 1;
         }
     };
-    let lookup_by = LookUpBy::Name(dev);
+    let lookup_by = LookUpBy::Name(dev.to_string());
+    let rate_limit = Some(100000000);
     let mut sender = match Sender::new::<NcclMetadataList>(
         lookup_by,
         receiver_address,
@@ -249,6 +285,7 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
         num_qps as u32,
         family,
         mode,
+        rate_limit
     ){
         Ok(sender) => sender,
         Err(e) => {
@@ -263,6 +300,10 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
     if let Err(e) = sender.connect(){
         log::error!("Error connecting: {:?}", e);
         return 1;
+    }
+    //let _ = sender.event_tracker();
+    for qp in sender.qps(){
+        log::info!("{} send con_id {} hca {} l_addr {} r_addr {}", get_hostname(), sender.connection_id(), qp.hca_name(), qp.local_gid(), qp.remote_gid());
     }
     let mut state = State::new(num_qps as usize);
     state.id = rand::random::<u32>();
@@ -295,6 +336,10 @@ extern "C" fn plugin_accept(listen_comm: *mut c_void, recv_comm: *mut *mut c_voi
             log::error!("Error accepting: {:?}", e);
             return 1;
         }
+        for qp in receiver.qp_list(){
+            log::info!("{} recv con_id {} hca {} l_addr {} r_addr {}", get_hostname(), receiver.connection_id(), qp.hca_name(), qp.local_gid(), qp.remote_gid());
+        }
+        //let _ = receiver.event_tracker();
         let receiver_handle = Box::into_raw(sender_receiver);
         unsafe {
             *recv_comm = receiver_handle as *mut c_void;
@@ -360,12 +405,9 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
 
     let (
         in_buffer_ptr,
-        out_buffer_mr_addr,
-        out_buffer_mr_lkey,
-        in_remote_buffer_addr,
-        in_remote_buffer_rkey,
         num_qps,
-        mut qp_list
+        mut qp_list,
+        qp_health_tracker,
     ) = {
         let sender = sender.sender();
         let sender = match sender.read(){
@@ -378,14 +420,19 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
         };
         (
             sender.in_buffer_ptr(),
-            sender.out_buffer_mr().addr(),
-            sender.out_buffer_mr().lkey(),
-            sender.in_remote_buffer_addr(),
-            sender.in_remote_buffer_rkey(),
             sender.num_qps(),
-            sender.qps().clone()
+            sender.qps().clone(),
+            sender.qp_health_tracker().clone(),
         )
     };
+
+    /*
+    if qp_health_tracker.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+        //println!("{} plugin_isend error {:?}", get_hostname(), "QP health check failed");
+    }
+    */
+
+
 
     let start_position = state.metadata_allocator.allocate(1);
     let in_nccl_metadata_list = in_buffer_ptr as *mut NcclMetadataList;
@@ -399,20 +446,9 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
         return 0;
     }
 
-    let (data_request_idx, _, heartbeat_idx, request) = state.request_manager.create_request();
+    let (data_request_idx, _, _heartbeat_idx, request) = state.request_manager.create_request();
     let completion_tracker = state.completion_tracker.clone();
-    let heartbeat_wr = ibverbs_rs::IbvSendWr::new(
-        out_buffer_mr_addr,
-        out_buffer_mr_lkey,
-        in_remote_buffer_addr,
-        in_remote_buffer_rkey,
-        0,
-        0,
-        IbvWrOpcode::RdmaWrite,
-        false,
-        Some(heartbeat_idx),
-        false,
-    );
+
     let mut request_lock = request.lock().unwrap();
     request_lock.idx = data_request_idx as u32;
     request_lock.request_type = RequestType::SendData;
@@ -420,7 +456,7 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
     request_lock.stage = RequestStage::WaitForSendCompletion;
     request_lock.sizes = vec![_size as u32];
     request_lock.debug = state.debug;
-    request_lock.heartbeat_wr = Some(heartbeat_wr);
+    request_lock.heartbeat_wr = None;
 
     let req_id = in_nccl_metadata.context;
     request_lock.id = req_id;
@@ -459,6 +495,7 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
         nccl_metadata: Some(in_nccl_metadata.clone()),
         request_idx: data_request_idx,
         data_tracker: None,
+        qp_health_tracker,
     };
 
     in_nccl_metadata.address = 0;
@@ -496,6 +533,7 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
         in_remote_buffer_rkey,
         num_qps,
         mut qp_list,
+        qp_health_tracker,
     ) = {
         let receiver = receiver.receiver();
         let receiver = match receiver.read(){
@@ -514,24 +552,11 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
             receiver.in_remote_buffer_rkey(),
             receiver.num_qps(),
             receiver.qp_list(),
+            receiver.qp_health_tracker(),
         )
     };
-
     let request_manager = state.request_manager.clone();
-    let (data_request_idx, metadata_request_idx, heartbeat_idx, request) = request_manager.create_request();
-    let heartbeat_wr = ibverbs_rs::IbvSendWr::new(
-        out_buffer_mr_addr,
-        out_buffer_mr_lkey,
-        in_remote_buffer_addr,
-        in_remote_buffer_rkey,
-        0,
-        0,
-        IbvWrOpcode::RdmaWriteWithImm,
-        false,
-        Some(heartbeat_idx),
-        false,
-    );
-
+    let (data_request_idx, metadata_request_idx, _heartbeat_idx, request) = request_manager.create_request();
     let mut request_lock = request.lock().unwrap();
     request_lock.request_type = RequestType::RecvData;
     request_lock.stage = RequestStage::SendMetadata;
@@ -539,14 +564,14 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
     request_lock.idx = data_request_idx as u32;
     request_lock.id = rand::random::<u32>() as u64;
     request_lock.debug = state.debug;
-    request_lock.heartbeat_wr = Some(heartbeat_wr);
+    request_lock.heartbeat_wr = None;
     let metadata_allocator = state.metadata_allocator.clone();
     let start_position = metadata_allocator.allocate(n as usize);
     let completion_tracker = state.completion_tracker.clone();
     for i in 0..num_qps{
         request_lock.expected_completions += 1;
         let recv_wr = IbvRecvWr::new(None, Some(data_request_idx));
-        if let Err(e) = qp_list.get_mut(i).unwrap().ibv_post_recv(recv_wr){
+        if let Err(e) = qp_list[i].ibv_post_recv(recv_wr){
             println!("Error posting receive: {:?}", e);
             return 1;
         }
@@ -599,6 +624,7 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
         nccl_metadata: None,
         request_idx: data_request_idx,
         data_tracker: None,
+        qp_health_tracker,
     };
     let test_request_box = Box::new(test_request);
     let test_request_ptr: *mut TestRequest = Box::into_raw(test_request_box);
@@ -631,6 +657,9 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
             _request = null_mut();
             return 0;
         }
+    }
+    if boxed_test_request.qp_health_tracker.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+        //println!("{} plugin_test error {:?}", get_hostname(), "QP health check failed");
     }
     for (qp_idx, qp) in boxed_test_request.qp_list.iter_mut().enumerate(){
         let outstanding_completions = completion_tracker._get_num_of_combined_uncompleted_requests(qp_idx);
@@ -691,6 +720,8 @@ extern "C" fn plugin_get_device_mr(_comm: *mut c_void, _mhandle: *mut c_void, _d
 }
 
 #[no_mangle]
+#[allow(non_snake_case)]
+#[allow(non_upper_case_globals)]
 pub static ncclNetPlugin_v8: ncclNet_v8_t = ncclNet_v8_t {
     name: "jnpr\0".as_ptr() as *const c_char,
     init: Some(plugin_init),
@@ -716,6 +747,31 @@ pub static ncclNetPlugin_v8: ncclNet_v8_t = ncclNet_v8_t {
 fn get_hostname() -> String {
     let hostname = hostname::get().unwrap();
     hostname.into_string().unwrap()
+}
+
+fn get_devices(filter: Vec<String>) -> anyhow::Result<u32, CustomError>{
+    let device_list: *mut *mut ibv_device = unsafe { __ibv_get_device_list(null_mut()) };
+    let mut num_devices = 0;
+    let mut device_counter = 0;
+    while !unsafe { *device_list.offset(num_devices) }.is_null() {
+        num_devices += 1;
+    }
+    if num_devices == 0 {
+        return Err(CustomError::new("ibv_get_device_list".to_string(), -1).into());
+    }
+    for i in 0..num_devices {
+        let device: *mut ibv_device = unsafe { *device_list.offset(i as isize) };
+        let device_ctx = unsafe { ibv_open_device(device) };
+        if device_ctx == null_mut() {
+            return Err(CustomError::new("Failed to open device".to_string(), -1));
+        }
+        let device_name = unsafe { CStr::from_ptr((*device).name.as_ptr()) };
+        let dev_name_string = device_name.to_str().unwrap();
+        if filter.contains(&dev_name_string.to_string()) {
+            device_counter += 1;
+        }
+    }
+    Ok(device_counter)
 }
 
 pub fn get_device_properties(dev_name: String) -> anyhow::Result<ncclNetProperties_v8_t, CustomError> {
@@ -763,6 +819,46 @@ pub fn get_device_properties(dev_name: String) -> anyhow::Result<ncclNetProperti
     
     }
     Err(CustomError::new("Device not found".to_string(), -1))
+
+}
+
+pub fn get_device_properties_by_index(dev_idx: i32) -> anyhow::Result<ncclNetProperties_v8_t, CustomError> {
+    let device_list: *mut *mut ibv_device = unsafe { __ibv_get_device_list(null_mut()) };
+    let mut num_devices = 0;
+    while !unsafe { *device_list.offset(num_devices) }.is_null() {
+        num_devices += 1;
+    }
+    if num_devices == 0 {
+        return Err(CustomError::new("ibv_get_device_list".to_string(), -1).into());
+    }
+    let device: *mut ibv_device = unsafe { *device_list.offset(dev_idx as isize) };
+    let device_ctx = unsafe { ibv_open_device(device) };
+    if device_ctx == null_mut() {
+        return Err(CustomError::new("Failed to open device".to_string(), -1));
+    }
+    let mut device_attr = unsafe { std::mem::zeroed::<ibv_device_attr>() };
+    let ret = unsafe { ibv_query_device(device_ctx, &mut device_attr) };
+    if ret != 0 {
+        return Err(CustomError::new("Failed to query device".to_string(), ret));
+    }
+    let device_name = unsafe { CStr::from_ptr((*device).name.as_ptr()) };
+    let pci_path = format!("/sys/class/infiniband/{}/device", device_name.to_str().unwrap());
+    let speed = 400000;
+    let props = ncclNetProperties_v8_t{
+        name: device_name.as_ptr() as *mut i8,
+        pciPath: pci_path.as_ptr() as *mut i8,
+        guid: device_attr.node_guid,
+        ptrSupport: (NCCL_PTR_HOST|NCCL_PTR_CUDA|NCCL_PTR_DMABUF) as i32,
+        speed,
+        port: 1,
+        maxComms: 1024 * 1024,
+        regIsGlobal: 0,
+        latency: 0.0,
+        maxRecvs: 8,
+        netDeviceType: 0,
+        netDeviceVersion: 0,
+    };
+    return Ok(props);
 
 }
 
@@ -1230,6 +1326,7 @@ struct TestRequest{
     nccl_metadata: Option<NcclMetadata>,
     request_idx: u64,
     data_tracker: Option<Arc<DataTracker>>,
+    qp_health_tracker: Arc<AtomicU32>,
 }
 
 

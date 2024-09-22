@@ -22,7 +22,8 @@ rand = "0.8.5"
 rdma-sys = { git = "https://github.com/michaelhenkel/rdma-sys" }
 serde = { version = "1.0.209", features = ["derive", "serde_derive"] }
 # ibverbs uses branch v2
-ibverbs-rs = { git = "https://github.com/michaelhenkel/ibverbs-rs", branch = "v3" }
+#ibverbs-rs = { git = "https://github.com/michaelhenkel/ibverbs-rs", branch = "v3" }
+ibverbs-rs = { path =  "../ibverbs-rs" }
 log = "0.4.22"
 
 [build-dependencies]
