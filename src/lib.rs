@@ -491,26 +491,25 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
         let mut qp_remaining_volume = (_size as u64 + qps - 1 - qp_idx as u64) / qps;
 
         // Preallocate vectors to store work requests and scatter/gather entries
-        let mut wrs: Vec<ibv_send_wr> = Vec::new();
-        let mut sges: Vec<ibv_sge> = Vec::new();
+
+        let wr = &mut state.wrs.borrow_mut()[qp_idx as usize];
+        let sge = &mut state.sges.borrow_mut()[qp_idx as usize];
 
         while qp_remaining_volume > 0 && remaining_volume > 0 {
             let message = qp_remaining_volume.min(MAX_MESSAGE_SIZE);
             let is_last_message_for_qp = qp_remaining_volume == message;
 
             // Create sge without heap allocation
-            sges.push(ibv_sge {
+            *sge = ibv_sge {
                 addr: data_addr,
                 length: message as u32,
                 lkey: mhandle_mr.lkey(),
-            });
-            let sge_ptr = sges.last_mut().unwrap() as *mut ibv_sge;
-
+            };
             // Initialize wr without zeroing the entire struct
-            let mut wr = ibv_send_wr {
+            *wr = ibv_send_wr {
                 wr_id: data_request_idx,
                 next: std::ptr::null_mut(),
-                sg_list: sge_ptr,
+                sg_list: sge as *mut ibv_sge,
                 num_sge: 1,
                 opcode: if is_last_message_for_qp {
                     ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM
@@ -534,9 +533,7 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
                 wr.imm_data_invalidated_rkey_union.imm_data = message as u32;
             }
 
-            // Store wr in vector to keep it alive
-            wrs.push(wr);
-            let wr_ptr = wrs.last_mut().unwrap() as *mut ibv_send_wr;
+            let wr_ptr = wr as *mut ibv_send_wr;
 
             if !last_wr_ptr.is_null() {
                 unsafe {
@@ -1534,6 +1531,8 @@ pub struct RemoteHandle{
     psn: u32,
 }
 
+const MAX_QPS: usize = 64;
+
 #[allow(dead_code)]
 struct State{
     id: u32,
@@ -1555,9 +1554,13 @@ struct State{
     in_remote_buffer_addr: u64,
     in_remote_buffer_rkey: u32,
     num_qps: usize,
+    wrs: RefCell<[ibv_send_wr; MAX_QPS]>,
+    sges: RefCell<[ibv_sge; MAX_QPS]>,
 }
 impl State{
     fn new(num_qps: usize) -> Self{
+        let wrs: [ibv_send_wr; MAX_QPS] = unsafe { std::mem::zeroed() };
+        let sges: [ibv_sge; MAX_QPS] = unsafe { std::mem::zeroed() };
         State{
             id: 0,
             connection_id: 0,
@@ -1578,6 +1581,8 @@ impl State{
             in_remote_buffer_addr: 0,
             in_remote_buffer_rkey: 0,
             num_qps,
+            wrs: RefCell::new(wrs),
+            sges: RefCell::new(sges),
         }
     }
 }
