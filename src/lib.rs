@@ -162,7 +162,7 @@ extern "C" fn plugin_listen(_dev: c_int, handle: *mut c_void, listen_comm: *mut 
     let qp_mode = QpMode::Multi;
     // 200Gbps in kbps
     let rate_limit = Some(100000000);
-    let mut receiver = match Receiver::new::<NcclMetadataList>(lookup_by, port, qp_mode, rate_limit){
+    let mut receiver = match Receiver::new::<NcclMetadataList>(lookup_by, port, qp_mode, rate_limit, true){
         Ok(receiver) => receiver,
         Err(e) => {
             log::error!("Error creating receiver: {:?}", e);
@@ -294,7 +294,8 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
         num_qps as u32,
         family,
         mode,
-        rate_limit
+        rate_limit,
+        true,
     ){
         Ok(sender) => sender,
         Err(e) => {
@@ -465,7 +466,7 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
         return 0;
     }
 
-    let (data_request_idx, _, _heartbeat_idx, request) = state.request_manager.create_request();
+    let (mut data_request_idx, _, _heartbeat_idx, request) = state.request_manager.create_request();
     let completion_tracker = state.completion_tracker.clone();
     request.set_idx(data_request_idx as u32);
     request.set_connection_id(state.connection_id);
@@ -480,32 +481,28 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
     let mut remaining_volume = _size as u64;
     let mut data_addr = _data as u64;
     let qps = qp_list.borrow().len() as u64;
-
+    let wrs = &mut state.wrs.borrow_mut();
+    let sges = &mut state.sges.borrow_mut();
 
     for (qp_idx, qp) in qp_list.borrow_mut().iter_mut().enumerate() {
         request.expected_completions.fetch_add(1, Ordering::SeqCst);
-        completion_tracker.mark_uncomplete(data_request_idx, qp_idx);
+        data_request_idx |= (qp_idx as u64 & 0x1F) << 57;
+        completion_tracker.mark_uncomplete(data_request_idx);
 
         let mut last_wr_ptr: *mut ibv_send_wr = std::ptr::null_mut();
         let mut first_wr_ptr: *mut ibv_send_wr = std::ptr::null_mut();
         let mut qp_remaining_volume = (_size as u64 + qps - 1 - qp_idx as u64) / qps;
-
-        // Preallocate vectors to store work requests and scatter/gather entries
-
-        let wr = &mut state.wrs.borrow_mut()[qp_idx as usize];
-        let sge = &mut state.sges.borrow_mut()[qp_idx as usize];
+        let wr = &mut wrs[qp_idx as usize];
+        let sge = &mut sges[qp_idx as usize];
 
         while qp_remaining_volume > 0 && remaining_volume > 0 {
             let message = qp_remaining_volume.min(MAX_MESSAGE_SIZE);
             let is_last_message_for_qp = qp_remaining_volume == message;
-
-            // Create sge without heap allocation
             *sge = ibv_sge {
                 addr: data_addr,
                 length: message as u32,
                 lkey: mhandle_mr.lkey(),
             };
-            // Initialize wr without zeroing the entire struct
             *wr = ibv_send_wr {
                 wr_id: data_request_idx,
                 next: std::ptr::null_mut(),
@@ -523,16 +520,11 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
                 },
                 ..unsafe { std::mem::zeroed() } // Zero the rest if necessary
             };
-
-            // Access the union field for rdma
             wr.wr.rdma.remote_addr = remote_addr;
             wr.wr.rdma.rkey = in_nccl_metadata.rkey;
-            
-
             if is_last_message_for_qp {
                 wr.imm_data_invalidated_rkey_union.imm_data = message as u32;
             }
-
             let wr_ptr = wr as *mut ibv_send_wr;
 
             if !last_wr_ptr.is_null() {
@@ -599,11 +591,9 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
     let qp_health_tracker = state.qp_health_tracker.clone();
 
     let request_manager = state.request_manager.clone();
-    let (data_request_idx, metadata_request_idx, _heartbeat_idx, request) = request_manager.create_request();
-    
-
-
-
+    let (mut data_request_idx, mut metadata_request_idx, _heartbeat_idx, request) = request_manager.create_request();
+    data_request_idx |= (0 & 0x1F) << 57; 
+    metadata_request_idx |= (0 & 0x1F) << 57;
     request.set_connection_id(state.connection_id);
     request.set_idx(data_request_idx as u32);
     let id = rand::random::<u32>();
@@ -620,7 +610,7 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
             println!("Error posting receive: {:?}", e);
             return 1;
         }
-        completion_tracker.mark_uncomplete(data_request_idx, i);
+        completion_tracker.mark_uncomplete(data_request_idx);
     }
     let out_nccl_metadata_list = out_buffer_ptr as *mut NcclMetadataList;
     let out_nccl_metadata_list: &mut NcclMetadataList = unsafe { &mut *out_nccl_metadata_list };
@@ -658,7 +648,7 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
         return 1;
     }
 
-    completion_tracker.mark_uncomplete(metadata_request_idx, 0);
+    completion_tracker.mark_uncomplete(metadata_request_idx);
     let test_request = TestRequest{
         qp_list,
         request_manager: state.request_manager.clone(),
@@ -686,7 +676,9 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
     unsafe { * _done = 0; }
     let completion_tracker = &boxed_test_request.completion_tracker;
     {
-        let request = boxed_test_request.request_manager.get_request(boxed_test_request.request_idx as usize);
+        let mut request_idx = boxed_test_request.request_idx;
+        request_idx &= !(0x1F << 57);
+        let request = boxed_test_request.request_manager.get_request(request_idx as usize);
         if request.get_completed() {
             let size: u32 = request.sizes.load(Ordering::SeqCst) as u32;
             unsafe { *_size = size as i32; }
@@ -697,6 +689,47 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
         }
     }
 
+    let qp = &mut boxed_test_request.qp_list.borrow_mut()[0];
+    let cq = qp.recv_cq().as_ptr();
+    const MAX_COMPLETIONS: usize = 64; // Adjust as needed
+    let mut wc_array: [MaybeUninit<ibv_wc>; MAX_COMPLETIONS];
+    unsafe {
+        wc_array = MaybeUninit::uninit().assume_init();
+    }
+    let wc_ptr = wc_array.as_mut_ptr() as *mut ibv_wc;
+    let wc_done = unsafe { ibv_poll_cq(cq, MAX_COMPLETIONS as i32, wc_ptr) };
+    let wc_slice = unsafe { std::slice::from_raw_parts(wc_ptr, wc_done as usize) };
+    for wc in wc_slice {
+        let status = wc.status;
+        if status != ibv_wc_status::IBV_WC_SUCCESS {
+            return 1;
+        }
+        let opcode = wc.opcode;
+        let wr_id = wc.wr_id;
+        if wr_id & (1 << 62) != 0 {
+            continue;
+        }
+        let is_metadata_completion = (wr_id & (1 << 63)) != 0;
+        let mut request_idx = wr_id;
+        request_idx &= !(0x1F << 57);
+        let request = boxed_test_request
+            .request_manager
+            .get_request(request_idx as usize);
+        if is_metadata_completion {
+            request.set_md_completed(true);
+            completion_tracker.mark_complete(wr_id);
+        } else {
+            if opcode == 129 {
+                request.sizes.fetch_add(unsafe { wc.imm_data_invalidated_rkey_union.imm_data as u64}, Ordering::SeqCst);
+            }
+            request.actual_completions.fetch_add(1, Ordering::SeqCst);
+            if request.expected_completions.load(Ordering::SeqCst) == request.actual_completions.load(Ordering::SeqCst) {
+                completion_tracker.mark_complete(wr_id);
+                request.set_completed(true);
+            }
+        }
+    }
+    /*
     for (qp_idx, qp) in boxed_test_request.qp_list.borrow_mut().iter_mut().enumerate(){
         let cq = qp.recv_cq().as_ptr();
         const MAX_COMPLETIONS: usize = 64; // Adjust as needed
@@ -723,19 +756,20 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
                 .get_request(wr_id as usize);
             if is_metadata_completion {
                 request.set_md_completed(true);
-                completion_tracker.mark_complete(wr_id, qp_idx);
+                completion_tracker.mark_complete(wr_id);
             } else {
                 if opcode == 129 {
                     request.sizes.fetch_add(unsafe { wc.imm_data_invalidated_rkey_union.imm_data as u64}, Ordering::SeqCst);
                 }
                 request.actual_completions.fetch_add(1, Ordering::SeqCst);
                 if request.expected_completions.load(Ordering::SeqCst) == request.actual_completions.load(Ordering::SeqCst) {
-                    completion_tracker.mark_complete(wr_id, qp_idx);
+                    completion_tracker.mark_complete(wr_id);
                     request.set_completed(true);
                 }
             }
         }
     }
+    */
     0
 }
 extern "C" fn plugin_close_send(_send_comm: *mut c_void) -> ncclResult_t { 
@@ -1362,70 +1396,75 @@ impl RetryTracker{
 }
 
 struct CompletionTracker {
-    data_completion_bitmask: Vec<Arc<AtomicUsize>>,       // Bitmask for data request completions
+    data_completion_bitmask: Arc<AtomicUsize>,       // Bitmask for data request completions
     metadata_completion_bitmask: Arc<AtomicUsize>,   // Bitmask for metadata request completions
     heartbeat_completion_bitmask: Arc<AtomicUsize>,  // Bitmask for heartbeat request completions
 }
 
 impl CompletionTracker {
-    fn new(num_qps: usize) -> Self {
-        let data_completion_bitmask = (0..num_qps)
-            .map(|_| Arc::new(AtomicUsize::new(0)))
-            .collect::<Vec<_>>();
+    fn new() -> Self {
         CompletionTracker {
-            data_completion_bitmask,
+            data_completion_bitmask: Arc::new(AtomicUsize::new(0)),
             metadata_completion_bitmask: Arc::new(AtomicUsize::new(0)),
             heartbeat_completion_bitmask: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     /// Mark the request as complete by setting the corresponding bit in the appropriate bitmask
-    fn mark_complete(&self, request_id: u64, qp_id: usize) {
-        let index = (request_id & !(1 << 63)) as usize; // Get the index without MSB
-        let is_metadata = (request_id & (1 << 63)) != 0; // Check if MSB is set
-        let is_heartbeat = (request_id & (1 << 62)) != 0; // Check if 2nd MSB is set
-
-        let mask = 1 << index;
+    fn mark_complete(&self, request_id: u64) {
+        let is_metadata = (request_id & (1 << 63)) != 0;   // Check if MSB is set
+        let is_heartbeat = (request_id & (1 << 62)) != 0;  // Check if 2nd MSB is set
 
         if is_metadata {
-            // Clear the bit in the metadata completion bitmask
+            let index = (request_id & 0x3F) as usize;      // Bits 0-5
+            let mask = 1 << index;
             self.metadata_completion_bitmask.fetch_and(!mask, Ordering::SeqCst);
-        } else if is_heartbeat{
-            // Clear the bit in the heartbeat completion bitmask
+        } else if is_heartbeat {
+            let index = (request_id & 0x3F) as usize;      // Bits 0-5
+            let mask = 1 << index;
             self.heartbeat_completion_bitmask.fetch_and(!mask, Ordering::SeqCst);
         } else {
-            // Clear the bit in the data completion bitmask
-            self.data_completion_bitmask[qp_id].fetch_and(!mask, Ordering::SeqCst);
+            let qp_id = ((request_id >> 59) & 0x7) as usize;   // Bits 59-61
+            let index = (request_id & 0x3F) as usize;          // Bits 0-5
+
+            let bit_index = (qp_id << 6) | index;  // Combine qp_id and index
+            let mask = 1 << bit_index;
+            self.data_completion_bitmask.fetch_and(!mask, Ordering::SeqCst);
         }
     }
 
     /// Mark the request as uncomplete by clearing the corresponding bit in the appropriate bitmask
-    fn mark_uncomplete(&self, request_id: u64, qp_id: usize) {
-        let index = (request_id & !(1 << 63)) as usize; // Get the index without MSB
-        let is_metadata = (request_id & (1 << 63)) != 0; // Check if MSB is set
-        let is_heartbeat = (request_id & (1 << 62)) != 0; // Check if 2nd MSB is set
-
-        let mask = 1 << index;
+    fn mark_uncomplete(&self, request_id: u64) {
+        let is_metadata = (request_id & (1 << 63)) != 0;
+        let is_heartbeat = (request_id & (1 << 62)) != 0;
 
         if is_metadata {
-            // Set the bit in the metadata completion bitmask
+            let index = (request_id & 0x3F) as usize;
+            let mask = 1 << index;
             self.metadata_completion_bitmask.fetch_or(mask, Ordering::SeqCst);
-        } else if is_heartbeat{
-            // Set the bit in the heartbeat completion bitmask
+        } else if is_heartbeat {
+            let index = (request_id & 0x3F) as usize;
+            let mask = 1 << index;
             self.heartbeat_completion_bitmask.fetch_or(mask, Ordering::SeqCst);
         } else {
-            // Set the bit in the data completion bitmask
-            self.data_completion_bitmask[qp_id].fetch_or(mask, Ordering::SeqCst);
+            let qp_id = ((request_id >> 59) & 0x7) as usize;
+            let index = (request_id & 0x3F) as usize;
+
+            let bit_index = (qp_id << 6) | index;
+            let mask = 1 << bit_index;
+            self.data_completion_bitmask.fetch_or(mask, Ordering::SeqCst);
         }
     }
-    fn _get_num_of_combined_uncompleted_requests(&self, qp_id: usize) -> usize {
-        self.data_completion_bitmask[qp_id]
-            .load(Ordering::SeqCst)
-            .count_ones() as usize + self.metadata_completion_bitmask
-            .load(Ordering::SeqCst)
-            .count_ones() as usize + self.heartbeat_completion_bitmask
+    fn get_num_of_combined_uncompleted_requests(&self) -> usize {
+        self.data_completion_bitmask
             .load(Ordering::SeqCst)
             .count_ones() as usize
+            + self.metadata_completion_bitmask
+                .load(Ordering::SeqCst)
+                .count_ones() as usize
+            + self.heartbeat_completion_bitmask
+                .load(Ordering::SeqCst)
+                .count_ones() as usize
     }
 }
 
@@ -1567,7 +1606,7 @@ impl State{
             recv_send: SendRecv::Send,
             request_manager: RequestManager::new(),
             metadata_allocator: Arc::new(MetadataAllocator::new()),
-            completion_tracker: Arc::new(CompletionTracker::new(num_qps)),
+            completion_tracker: Arc::new(CompletionTracker::new()),
             data_tracker: Arc::new(DataTracker::new()),
             retry_tracker: Arc::new(RetryTracker::new()),
             debug: false,
