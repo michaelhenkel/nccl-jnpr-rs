@@ -672,6 +672,7 @@ extern "C" fn plugin_iflush(_recv_comm: *mut c_void, _n: c_int, _data: *mut *mut
 }
 #[inline(always)]
 extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *mut c_int) -> ncclResult_t {
+    let now = std::time::Instant::now();
     let boxed_test_request = unsafe { &mut *(_request as *mut TestRequest) };
     unsafe { * _done = 0; }
     let completion_tracker = &boxed_test_request.completion_tracker;
@@ -688,7 +689,6 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
             return 0;
         }
     }
-
     let qp = &mut boxed_test_request.qp_list.borrow_mut()[0];
     let cq = qp.recv_cq().as_ptr();
     const MAX_COMPLETIONS: usize = 64; // Adjust as needed
@@ -729,47 +729,10 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
             }
         }
     }
-    /*
-    for (qp_idx, qp) in boxed_test_request.qp_list.borrow_mut().iter_mut().enumerate(){
-        let cq = qp.recv_cq().as_ptr();
-        const MAX_COMPLETIONS: usize = 64; // Adjust as needed
-        let mut wc_array: [MaybeUninit<ibv_wc>; MAX_COMPLETIONS];
-        unsafe {
-            wc_array = MaybeUninit::uninit().assume_init();
-        }
-        let wc_ptr = wc_array.as_mut_ptr() as *mut ibv_wc;
-        let wc_done = unsafe { ibv_poll_cq(cq, MAX_COMPLETIONS as i32, wc_ptr) };
-        let wc_slice = unsafe { std::slice::from_raw_parts(wc_ptr, wc_done as usize) };
-        for wc in wc_slice {
-            let status = wc.status;
-            if status != ibv_wc_status::IBV_WC_SUCCESS {
-                return 1;
-            }
-            let opcode = wc.opcode;
-            let wr_id = wc.wr_id;
-            if wr_id & (1 << 62) != 0 {
-                continue;
-            }
-            let is_metadata_completion = (wr_id & (1 << 63)) != 0;
-            let request = boxed_test_request
-                .request_manager
-                .get_request(wr_id as usize);
-            if is_metadata_completion {
-                request.set_md_completed(true);
-                completion_tracker.mark_complete(wr_id);
-            } else {
-                if opcode == 129 {
-                    request.sizes.fetch_add(unsafe { wc.imm_data_invalidated_rkey_union.imm_data as u64}, Ordering::SeqCst);
-                }
-                request.actual_completions.fetch_add(1, Ordering::SeqCst);
-                if request.expected_completions.load(Ordering::SeqCst) == request.actual_completions.load(Ordering::SeqCst) {
-                    completion_tracker.mark_complete(wr_id);
-                    request.set_completed(true);
-                }
-            }
-        }
-    }
-    */
+    let elapsed = now.elapsed();
+    println!("{} test elapsed {:?}", get_hostname(), elapsed);
+    std::thread::sleep(std::time::Duration::from_millis(1));
+
     0
 }
 extern "C" fn plugin_close_send(_send_comm: *mut c_void) -> ncclResult_t { 
