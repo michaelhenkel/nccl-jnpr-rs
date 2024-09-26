@@ -1,5 +1,5 @@
 use std::{
-    cell::RefCell, ffi::{c_void, CStr, CString}, fmt::{Debug, Display}, fs, mem::MaybeUninit, net::{IpAddr, Ipv4Addr, Ipv6Addr}, os::raw::c_char, pin::Pin, ptr::{self, null_mut}, sync::{
+    arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, cell::RefCell, ffi::{c_void, CStr, CString}, fmt::{Debug, Display}, fs, mem::MaybeUninit, net::{IpAddr, Ipv4Addr, Ipv6Addr}, os::raw::c_char, pin::Pin, ptr::{self, null_mut}, sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex, Once, RwLock
     }
@@ -311,12 +311,7 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
         log::error!("Error connecting: {:?}", e);
         return 1;
     }
-    //let _ = sender.event_tracker();
-    /*
-    for qp in sender.qps(){
-        log::info!("{} send con_id {} hca {} l_addr {} r_addr {}", get_hostname(), sender.connection_id(), qp.hca_name(), qp.local_gid(), qp.remote_gid());
-    }
-    */
+
     let mut state = State::new(num_qps as usize);
     state.id = rand::random::<u32>();
     state.connection_id = sender.connection_id();
@@ -429,7 +424,7 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
     let sender_receiver = unsafe { &mut *(send_comm as *mut SenderReceiver) };
 
     
-    let (sender, state) = if let SenderReceiver::Sender { sender, state } = sender_receiver {
+    let (_sender, state) = if let SenderReceiver::Sender { sender, state } = sender_receiver {
         (sender, state)
     } else {
         println!("{} plugin_isend error {:?}", get_hostname(), "Not a sender");
@@ -440,21 +435,6 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
     let in_buffer_ptr = state.in_buffer_ptr;
     let qp_health_tracker = state.qp_health_tracker.clone();
     let qp_list = &state.qps;
-
-    /*
-    let (in_buffer_ptr, qp_list, qp_health_tracker) = {
-        let sender = sender.sender();
-        let sender_guard = sender.read().unwrap_or_else(|poisoned| {
-            println!("poisoned");
-            poisoned.into_inner()
-        });
-        (
-            sender_guard.in_buffer_ptr(),
-            sender_guard.qps(), // Avoid cloning qp_list
-            sender_guard.qp_health_tracker().clone(), // Clone if necessary
-        )
-    };
-    */
     let start_position = state.metadata_allocator.allocate(1);
     let in_nccl_metadata_list = in_buffer_ptr as *mut NcclMetadataList;
     let in_nccl_metadata_list: &mut NcclMetadataList = unsafe { &mut *in_nccl_metadata_list };
@@ -472,8 +452,7 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
     request.set_connection_id(state.connection_id);
     request.set_sizes(_size as u64);
     request.set_debug(state.debug);
-    let req_id = in_nccl_metadata.context;
-    request.set_id(req_id as u64);
+    request.set_id(in_nccl_metadata.context as u64);
     
     let mhandle_mr = unsafe { &mut *(_mhandle as *mut IbvMr) };
 
@@ -483,8 +462,9 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
     let qps = qp_list.borrow().len() as u64;
     let wrs = &mut state.wrs.borrow_mut();
     let sges = &mut state.sges.borrow_mut();
-
+    //let now = std::time::Instant::now();
     for (qp_idx, qp) in qp_list.borrow_mut().iter_mut().enumerate() {
+        unsafe { _mm_prefetch(qp as *const _ as *const i8, _MM_HINT_T0) };
         request.expected_completions.fetch_add(1, Ordering::SeqCst);
         data_request_idx |= (qp_idx as u64 & 0x1F) << 57;
         completion_tracker.mark_uncomplete(data_request_idx);
@@ -541,13 +521,20 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
             remaining_volume -= message;
             qp_remaining_volume -= message;
         }
+        let _ = qp.ibv_post_send(first_wr_ptr);
+        /*
         if let Err(e) = qp.ibv_post_send(first_wr_ptr) {
             println!("{} isend post error {:?}", get_hostname(), e);
             log::error!("Error posting send: {:?}", e);
             return 1;
         }
+        */
     }
-
+    /*
+    let elapsed = now.elapsed();
+    println!("{}  elapsed {:?}", get_hostname(), elapsed);
+    std::thread::sleep(std::time::Duration::from_millis(1));
+    */
     let test_request = TestRequest{
         qp_list,
         request_manager: state.request_manager.clone(),
@@ -670,9 +657,15 @@ extern "C" fn plugin_iflush(_recv_comm: *mut c_void, _n: c_int, _data: *mut *mut
     println!("{} iflush", get_hostname());
     0
 }
+
+const IBV_WC_RECV_RDMA_WITH_IMM: u32 = 129;
+const WR_ID_IGNORE_MASK: u64 = 1 << 62;
+const WR_ID_METADATA_MASK: u64 = 1 << 63;
+const REQUEST_IDX_MASK: u64 = 0x1F << 57;
+
 #[inline(always)]
 extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *mut c_int) -> ncclResult_t {
-    let now = std::time::Instant::now();
+
     let boxed_test_request = unsafe { &mut *(_request as *mut TestRequest) };
     unsafe { * _done = 0; }
     let completion_tracker = &boxed_test_request.completion_tracker;
@@ -681,7 +674,7 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
         request_idx &= !(0x1F << 57);
         let request = boxed_test_request.request_manager.get_request(request_idx as usize);
         if request.get_completed() {
-            let size: u32 = request.sizes.load(Ordering::SeqCst) as u32;
+            let size: u32 = request.sizes.load(Ordering::Acquire) as u32;
             unsafe { *_size = size as i32; }
             unsafe { * _done = 1; }
             request.reset();
@@ -700,39 +693,40 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
     let wc_done = unsafe { ibv_poll_cq(cq, MAX_COMPLETIONS as i32, wc_ptr) };
     let wc_slice = unsafe { std::slice::from_raw_parts(wc_ptr, wc_done as usize) };
     for wc in wc_slice {
-        let status = wc.status;
-        if status != ibv_wc_status::IBV_WC_SUCCESS {
+        unsafe { _mm_prefetch(wc as *const _ as *const i8, _MM_HINT_T0) };
+        if wc.status != ibv_wc_status::IBV_WC_SUCCESS {
             return 1;
         }
-        let opcode = wc.opcode;
         let wr_id = wc.wr_id;
-        if wr_id & (1 << 62) != 0 {
+        if wr_id & WR_ID_IGNORE_MASK != 0 {
             continue;
         }
-        let is_metadata_completion = (wr_id & (1 << 63)) != 0;
-        let mut request_idx = wr_id;
-        request_idx &= !(0x1F << 57);
+        let is_metadata_completion = (wr_id & WR_ID_METADATA_MASK) != 0;
+        let request_idx = (wr_id & !REQUEST_IDX_MASK) as usize;
+        //request_idx &= !(0x1F << 57);
         let request = boxed_test_request
             .request_manager
-            .get_request(request_idx as usize);
+            .get_request(request_idx);
+
         if is_metadata_completion {
             request.set_md_completed(true);
             completion_tracker.mark_complete(wr_id);
-        } else {
-            if opcode == 129 {
-                request.sizes.fetch_add(unsafe { wc.imm_data_invalidated_rkey_union.imm_data as u64}, Ordering::SeqCst);
-            }
-            request.actual_completions.fetch_add(1, Ordering::SeqCst);
-            if request.expected_completions.load(Ordering::SeqCst) == request.actual_completions.load(Ordering::SeqCst) {
-                completion_tracker.mark_complete(wr_id);
-                request.set_completed(true);
-            }
+            continue;
+        }
+
+        if wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM {
+            let imm_data = unsafe { wc.imm_data_invalidated_rkey_union.imm_data as u64 };
+            request.sizes.fetch_add(imm_data, Ordering::Relaxed);
+        }
+    
+        let actual_completions = request.actual_completions.fetch_add(1, Ordering::Relaxed) + 1;
+        let expected_completions = request.expected_completions.load(Ordering::Acquire);
+    
+        if actual_completions == expected_completions {
+            completion_tracker.mark_complete(wr_id);
+            request.set_completed(true);
         }
     }
-    let elapsed = now.elapsed();
-    println!("{} test elapsed {:?}", get_hostname(), elapsed);
-    std::thread::sleep(std::time::Duration::from_millis(1));
-
     0
 }
 extern "C" fn plugin_close_send(_send_comm: *mut c_void) -> ncclResult_t { 
@@ -1186,18 +1180,18 @@ struct Request{
 }
 
 impl Request{
-    fn new() -> Self{
+    fn new(idx: u32, conn_id: u32, size: u64, debug: bool, id: u64) -> Self{
         Request{
-            connection_id: AtomicU32::new(0),
-            idx: AtomicU32::new(0),
-            sizes: AtomicU64::new(0),
-            id: AtomicU64::new(0),
+            connection_id: AtomicU32::new(conn_id),
+            idx: AtomicU32::new(idx),
+            sizes: AtomicU64::new(size),
+            id: AtomicU64::new(id),
             completed: AtomicBool::new(false),
             md_completed: AtomicBool::new(false),
             md_idx: AtomicU32::new(0),
             expected_completions: AtomicU32::new(0),
             actual_completions: AtomicU32::new(0),
-            debug: AtomicBool::new(false),
+            debug: AtomicBool::new(debug),
             retries: AtomicU32::new(0),
         }
     }
@@ -1214,59 +1208,67 @@ impl Request{
         self.debug.store(false, Ordering::SeqCst);
         self.retries.store(0, Ordering::SeqCst);
     }
+    #[inline(always)]
     fn set_idx(&self, idx: u32) {
         self.idx.store(idx, Ordering::SeqCst);
     }
-
+    #[inline(always)]
     fn set_connection_id(&self, connection_id: u32) {
         self.connection_id.store(connection_id, Ordering::SeqCst);
     }
-
+    #[inline(always)]
     fn set_sizes(&self, sizes: u64) {
         self.sizes.store(sizes, Ordering::SeqCst);
     }
-
+    #[inline(always)]
     fn set_id(&self, id: u64) {
         self.id.store(id, Ordering::SeqCst);
     }
-
+    #[inline(always)]
     fn set_completed(&self, completed: bool) {
         self.completed.store(completed, Ordering::SeqCst);
     }
-
+    #[inline(always)]
     fn set_md_completed(&self, md_completed: bool) {
         self.md_completed.store(md_completed, Ordering::SeqCst);
     }
-
-    fn set_md_idx(&self, md_idx: u32) {
-        self.md_idx.store(md_idx, Ordering::SeqCst);
-    }
-
+    #[inline(always)]
     fn set_expected_completions(&self, expected_completions: u32) {
         self.expected_completions.store(expected_completions, Ordering::SeqCst);
     }
-
-    fn set_actual_completions(&self, actual_completions: u32) {
-        self.actual_completions.store(actual_completions, Ordering::SeqCst);
-    }
-
+    #[inline(always)]
     fn set_debug(&self, debug: bool) {
         self.debug.store(debug, Ordering::SeqCst);
     }
-
-    fn set_retries(&self, retries: u32) {
-        self.retries.store(retries, Ordering::SeqCst);
-    }
-
-    // You can also add getter methods
+    #[inline(always)]
     fn get_idx(&self) -> u32 {
         self.idx.load(Ordering::SeqCst)
     }
+    #[inline(always)]
     fn get_id(&self) -> u64 {
         self.id.load(Ordering::SeqCst)
     }
+    #[inline(always)]
     fn get_completed(&self) -> bool {
         self.completed.load(Ordering::SeqCst)
+    }
+}
+
+impl Default for Request{
+    fn default() -> Self {
+        Request{
+            connection_id: AtomicU32::new(0),
+            idx: AtomicU32::new(0),
+            sizes: AtomicU64::new(0),
+            id: AtomicU64::new(0),
+            completed: AtomicBool::new(false),
+            md_completed: AtomicBool::new(false),
+            md_idx: AtomicU32::new(0),
+            expected_completions: AtomicU32::new(0),
+            actual_completions: AtomicU32::new(0),
+            debug: AtomicBool::new(false),
+            retries: AtomicU32::new(0),
+        }
     }
 }
 
@@ -1304,21 +1306,21 @@ enum RequestType{
 
 struct RequestManager {
     requests: [Arc<Request>; MAX_REQUESTS as usize],
-    lock: Arc<Mutex<()>>,
+    //lock: Arc<Mutex<()>>,
     index: Arc<AtomicU64>,
 }
 
 impl RequestManager {
     fn new() -> Arc<Self> {
         let requests: [Arc<Request>; MAX_REQUESTS as usize] = (0..MAX_REQUESTS)
-            .map(|_| Arc::new(Request::new()))
+            .map(|_| Arc::new(Request::default()))
             .collect::<Vec<_>>()
             .try_into()
             .unwrap();
 
         Arc::new(RequestManager {
             requests,
-            lock: Arc::new(Mutex::new(())),
+            //lock: Arc::new(Mutex::new(())),
             index: Arc::new(AtomicU64::new(0)),
         })
     }
@@ -1327,7 +1329,7 @@ impl RequestManager {
         self.requests[idx as usize].clone()
     }
     fn create_request(&self) -> (u64, u64, u64, Arc<Request>) {
-        let _guard = self.lock.lock().unwrap(); // Ensure mutual exclusion
+        //let _guard = self.lock.lock().unwrap(); // Ensure mutual exclusion
         let current_index = self.index.load(Ordering::SeqCst);
         let metadata_index = (current_index | (1 << 63)) as u64;
         let heartbeat_index = (current_index | (1 << 62)) as u64;
