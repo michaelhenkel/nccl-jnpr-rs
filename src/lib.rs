@@ -414,9 +414,14 @@ extern "C" fn plugin_dereg_mr(_coll_comm: *mut c_void, _mhandle: *mut c_void) ->
     0
 }
 
+#[repr(align(64))]
+struct AlignedIbvSendWr(ibv_send_wr);
+
+#[repr(align(64))]
+struct AlignedIbvSge(ibv_sge);
+
 
 const MAX_MESSAGE_SIZE: u64 = 1024 * 1024 * 10;
-#[inline(always)]
 extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_int, _tag: c_int, _mhandle: *mut c_void, mut _request: *mut *mut c_void) -> ncclResult_t { 
     let sender_receiver = unsafe { &mut *(send_comm as *mut SenderReceiver) };
     let (_sender, state) = if let SenderReceiver::Sender { sender, state } = sender_receiver {
@@ -427,7 +432,7 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
         return 1;
     };
     let start_position = state.metadata_allocator.allocate(1);
-    let in_nccl_metadata_list = state.in_buffer_ptr as *mut NcclMetadataList;
+    let in_nccl_metadata_list: *mut NcclMetadataList = state.in_buffer_ptr as *mut NcclMetadataList;
     let in_nccl_metadata_list: &mut NcclMetadataList = unsafe { &mut *in_nccl_metadata_list };
     let in_nccl_metadata: &mut NcclMetadata = in_nccl_metadata_list.0.get_mut(start_position as usize).unwrap();
     if in_nccl_metadata.address == 0 || in_nccl_metadata.rkey == 0 {
@@ -436,7 +441,6 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
         return 0;
     }
     let (mut data_request_idx, _, _heartbeat_idx, request) = state.request_manager.create_request();
-    let completion_tracker = &mut state.completion_tracker;
     request.idx = data_request_idx as u32;
     request.connection_id = state.connection_id;
     request.sizes = _size as u64;
@@ -444,26 +448,32 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
     
     let mhandle_mr = unsafe { &mut *(_mhandle as *mut IbvMr) };
 
-    let mut remote_addr = in_nccl_metadata.address;
+    let mut remote_addr = in_nccl_metadata.address as *mut u8;
     let mut remaining_volume = _size as u64;
-    let mut data_addr = _data as u64;
-    let qp_list = &state.qps;
-    let qps = qp_list.borrow().len() as u64;
-    let wrs = &mut state.wrs.borrow_mut();
-    let sges = &mut state.sges.borrow_mut();
+    let mut data_addr = _data as *mut u8;
+    let qp_list = &mut state.qps;
+    let qps = qp_list.len() as u64;
+    let wrs: &mut [ibv_send_wr; 4096] = &mut state.wrs;
+    let sges: &mut [ibv_sge; 4096] = &mut state.sges;
     let lkey = mhandle_mr.lkey();
     let mut wr_idx = 0;
-    for (qp_idx, qp) in qp_list.borrow_mut().iter_mut().enumerate() {
+    let qps_reciprocal = 1.0 / qps as f64;
+    let adjusted_size = _size as u64 + qps - 1;
+    for (qp_idx, qp) in qp_list.iter_mut().enumerate() {
         unsafe { _mm_prefetch(qp as *const _ as *const i8, _MM_HINT_T0) };
         request.expected_completions += 1;
         data_request_idx |= (qp_idx as u64 & 0x1F) << 57;
-        completion_tracker.mark_uncomplete(data_request_idx);
-        let mut qp_remaining_volume = (_size as u64 + qps - 1 - qp_idx as u64) / qps;
+        state.completion_tracker.mark_uncomplete(data_request_idx);
+        let mut qp_remaining_volume = ((adjusted_size - qp_idx as u64) as f64 * qps_reciprocal).floor() as u64;
+
+        //let mut qp_remaining_volume = (_size as u64 + qps - 1 - qp_idx as u64) / qps;
+        let wrs_ptr = wrs.as_mut_ptr();
+        let sges_ptr = sges.as_mut_ptr();
         while qp_remaining_volume > 0 && remaining_volume > 0 {
-            let wr = &mut wrs[wr_idx as usize];
-            let sge = &mut sges[wr_idx as usize];
+            let wr = unsafe { &mut *wrs_ptr.add(wr_idx) };
+            let sge = unsafe { &mut *sges_ptr.add(wr_idx) };
             let message = qp_remaining_volume.min(MAX_MESSAGE_SIZE);
-            sge.addr = data_addr;
+            sge.addr = data_addr as u64;
             sge.length = message as u32;
             sge.lkey = lkey;
             wr.wr_id = data_request_idx;
@@ -471,7 +481,7 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
             wr.num_sge = 1;
             wr.opcode = ibv_wr_opcode::IBV_WR_RDMA_WRITE;
             wr.send_flags = 0;
-            wr.wr.rdma.remote_addr = remote_addr;
+            wr.wr.rdma.remote_addr = remote_addr as u64;
             wr.wr.rdma.rkey = in_nccl_metadata.rkey;
             if qp_remaining_volume == message {
                 wr.opcode = ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM;
@@ -480,10 +490,18 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
             }
             let wr_ptr = wr as *mut ibv_send_wr;
             let _ = qp.ibv_post_send(wr_ptr);
-            data_addr += message as u64;
-            remote_addr += message as u64;
+            data_addr = unsafe { data_addr.add(message as usize) };
+            remote_addr = unsafe { remote_addr.add(message as usize) };
             remaining_volume -= message;
             qp_remaining_volume -= message;
+
+            if (wr_idx + 1) < wrs.len() {
+                unsafe {
+                    _mm_prefetch(wrs_ptr.add(wr_idx + 1) as *const _ as *const i8, _MM_HINT_T0);
+                    _mm_prefetch(sges_ptr.add(wr_idx + 1) as *const _ as *const i8, _MM_HINT_T0);
+                }
+            }
+
             wr_idx += 1;
         }
     }
@@ -516,7 +534,7 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
         return 1;
     };
     let num_qps = state.num_qps;
-    let qp_list = &state.qps;
+    let qp_list = &mut state.qps;
     let request_manager = &mut state.request_manager;
     let (mut data_request_idx, mut metadata_request_idx, _heartbeat_idx, request) = request_manager.create_request();
     data_request_idx |= (0 & 0x1F) << 57; 
@@ -533,7 +551,7 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
     let completion_tracker = &mut state.completion_tracker;
     for i in 0..num_qps{
         let recv_wr = IbvRecvWr::new(None, Some(data_request_idx));
-        if let Err(e) = qp_list.borrow_mut()[i].ibv_post_recv(recv_wr){
+        if let Err(e) = qp_list[i].ibv_post_recv(recv_wr){
             println!("Error posting receive: {:?}", e);
             return 1;
         }
@@ -569,7 +587,7 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
         true
     );
 
-    if let Err(e) = qp_list.borrow_mut()[0].ibv_post_send(send_wr.as_ptr()){
+    if let Err(e) = qp_list[0].ibv_post_send(send_wr.as_ptr()){
         println!("{} plugin_irecv post error {:?}", get_hostname(),e);
         log::error!("Error posting send: {:?}", e);
         return 1;
@@ -609,8 +627,10 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
     {
         let mut request_idx = boxed_test_request.request_idx;
         request_idx &= !(0x1F << 57);
-        let request = boxed_test_request.request_manager.get_request(request_idx as usize);
-        if request.get_completed() {
+        request_idx &= !(1 << 63);
+        let request = &mut boxed_test_request.request_manager.requests[request_idx as usize];
+        unsafe { _mm_prefetch(request as *const _ as *const i8, _MM_HINT_T0) };
+        if request.completed {
             let size: u32 = request.sizes as u32;
             unsafe { *_size = size as i32; }
             unsafe { * _done = 1; }
@@ -621,7 +641,7 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
     }
     unsafe { * _done = 0; }
     let completion_tracker = &mut boxed_test_request.completion_tracker;
-    let qp = &mut boxed_test_request.qp_list.borrow_mut()[0];
+    let qp = &mut boxed_test_request.qp_list[0];
     let cq = qp.recv_cq().as_ptr();
     let mut wc_array: [MaybeUninit<ibv_wc>; MAX_COMPLETIONS];
     unsafe {
@@ -631,7 +651,6 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
     let wc_done = unsafe { ibv_poll_cq(cq, MAX_COMPLETIONS as i32, wc_ptr) };
     let wc_slice = unsafe { std::slice::from_raw_parts(wc_ptr, wc_done as usize) };
     for wc in wc_slice {
-        unsafe { _mm_prefetch(wc as *const _ as *const i8, _MM_HINT_T0) };
         if wc.status != ibv_wc_status::IBV_WC_SUCCESS {
             return 1;
         }
@@ -639,25 +658,22 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
         if wr_id & WR_ID_IGNORE_MASK != 0 {
             continue;
         }
-        let is_metadata_completion = (wr_id & WR_ID_METADATA_MASK) != 0;
-        let request_idx = (wr_id & !REQUEST_IDX_MASK) as usize;
-        let request = boxed_test_request
-            .request_manager
-            .get_request(request_idx);
-        if is_metadata_completion {
-            request.set_md_completed(true);
+        let mut request_idx = (wr_id & !REQUEST_IDX_MASK) as usize;
+        request_idx &= !(1 << 63);
+        let request = &mut boxed_test_request.request_manager.requests[request_idx as usize];
+        unsafe { _mm_prefetch(request as *const _ as *const i8, _MM_HINT_T0) };
+        if (wr_id & WR_ID_METADATA_MASK) == 0 {
+            if wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM {
+                request.sizes += unsafe { wc.imm_data_invalidated_rkey_union.imm_data as u64 };
+            }
+            request.actual_completions += 1;
+            if request.actual_completions == request.expected_completions {
+                completion_tracker.mark_complete(wr_id);
+                request.completed = true;
+            }
+        } else {
+            request.md_completed = true;
             completion_tracker.mark_complete(wr_id);
-            continue;
-        }
-        if wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM {
-            request.sizes += unsafe { wc.imm_data_invalidated_rkey_union.imm_data as u64 };
-        }
-        request.actual_completions += 1;
-        let actual_completions = request.actual_completions;
-        let expected_completions = request.expected_completions;
-        if actual_completions == expected_completions {
-            completion_tracker.mark_complete(wr_id);
-            request.set_completed(true);
         }
     }
     0
@@ -1440,7 +1456,7 @@ impl DataTracker {
 
 #[allow(dead_code)]
 struct TestRequest<'a>{
-    qp_list: &'a RefCell<Vec<IbvQp>>,
+    qp_list: &'a mut Vec<IbvQp>,
     request_manager: &'a mut RequestManager,
     completion_tracker: &'a mut CompletionTracker,
     wrs_debug: Option<WrsDebug>,
@@ -1480,15 +1496,15 @@ struct State{
     completion_tracker: CompletionTracker,
     debug: bool,
     in_buffer_ptr: *mut c_void,
-    qps: RefCell<Vec<IbvQp>>,
+    qps: Vec<IbvQp>,
     out_buffer_ptr: *mut c_void,
     out_buffer_mr_addr: u64,
     out_buffer_mr_lkey: u32,
     in_remote_buffer_addr: u64,
     in_remote_buffer_rkey: u32,
     num_qps: usize,
-    wrs: RefCell<[ibv_send_wr; MAX_WRS]>,
-    sges: RefCell<[ibv_sge; MAX_WRS]>,
+    wrs: [ibv_send_wr; MAX_WRS],
+    sges: [ibv_sge; MAX_WRS],
 }
 impl State{
     fn new(num_qps: usize) -> Self{
@@ -1503,15 +1519,15 @@ impl State{
             completion_tracker: CompletionTracker::new(),
             debug: false,
             in_buffer_ptr: null_mut(),
-            qps: RefCell::new(Vec::new()),
+            qps: Vec::new(),
             out_buffer_ptr: null_mut(),
             out_buffer_mr_addr: 0,
             out_buffer_mr_lkey: 0,
             in_remote_buffer_addr: 0,
             in_remote_buffer_rkey: 0,
             num_qps,
-            wrs: RefCell::new(wrs),
-            sges: RefCell::new(sges),
+            wrs,
+            sges,
         }
     }
 }
