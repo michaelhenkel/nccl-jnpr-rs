@@ -207,7 +207,7 @@ extern "C" fn plugin_listen(_dev: c_int, handle: *mut c_void, listen_comm: *mut 
     state.debug = debug;
     let listen_comm_handle = Box::into_raw(Box::new(SenderReceiver::Receiver { 
         receiver: ReceiverWrapper::new(Box::new(receiver)),
-        state: Arc::new(state), 
+        state, 
     }));
     if !listen_comm.is_null() {
         unsafe {
@@ -322,7 +322,7 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
     state.qp_health_tracker = sender.qp_health_tracker().clone();
     let sender_handle = Box::into_raw(Box::new(SenderReceiver::Sender{
         sender: SenderWrapper::new(Box::new(sender)),
-        state: Arc::new(state),
+        state,
     }));
 
     unsafe {
@@ -352,7 +352,7 @@ extern "C" fn plugin_accept(listen_comm: *mut c_void, recv_comm: *mut *mut c_voi
         new_state.in_buffer_ptr = receiver.in_buffer_ptr();
         new_state.qp_health_tracker = receiver.qp_health_tracker().clone();
         new_state.metadata_allocator = state.metadata_allocator.clone();
-        new_state.request_manager = state.request_manager.clone();
+        new_state.request_manager = RequestManager::new();
         new_state.completion_tracker = state.completion_tracker.clone();
         new_state.out_buffer_ptr = receiver.out_buffer_ptr();
         new_state.out_buffer_mr_addr = receiver.out_buffer_mr().addr();
@@ -360,7 +360,7 @@ extern "C" fn plugin_accept(listen_comm: *mut c_void, recv_comm: *mut *mut c_voi
         new_state.in_remote_buffer_addr = receiver.in_remote_buffer_addr();
         new_state.in_remote_buffer_rkey = receiver.in_remote_buffer_rkey();
         new_state.num_qps = receiver.num_qps();
-        sender_receiver.set_state(Arc::new(new_state));
+        sender_receiver.set_state(new_state);
         //state.qps = receiver.qp_list().clone();
 
         let receiver_handle = Box::into_raw(sender_receiver);
@@ -417,6 +417,7 @@ extern "C" fn plugin_reg_mr_dma_buf(_coll_comm: *mut c_void, _data: *mut c_void,
 extern "C" fn plugin_dereg_mr(_coll_comm: *mut c_void, _mhandle: *mut c_void) -> ncclResult_t { 
     0
 }
+
 
 const MAX_MESSAGE_SIZE: u64 = 1024 * 1024 * 10;
 #[inline(always)]
@@ -516,7 +517,7 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
     }
     let test_request = TestRequest{
         qp_list,
-        request_manager: state.request_manager.clone(),
+        request_manager: &mut state.request_manager,
         completion_tracker: state.completion_tracker.clone(),
         wrs_debug: None,
         nccl_metadata: Some(in_nccl_metadata.clone()),
@@ -545,7 +546,7 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
     };
     let num_qps = state.num_qps;
     let qp_list = &state.qps;
-    let request_manager = state.request_manager.clone();
+    let request_manager = &mut state.request_manager;
     let (mut data_request_idx, mut metadata_request_idx, _heartbeat_idx, request) = request_manager.create_request();
     data_request_idx |= (0 & 0x1F) << 57; 
     metadata_request_idx |= (0 & 0x1F) << 57;
@@ -606,7 +607,7 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
     completion_tracker.mark_uncomplete(metadata_request_idx);
     let test_request = TestRequest{
         qp_list,
-        request_manager: state.request_manager.clone(),
+        request_manager: &mut state.request_manager,
         completion_tracker: state.completion_tracker.clone(),
         wrs_debug: None,
         nccl_metadata: None,
@@ -1083,16 +1084,16 @@ impl NcclMetadata{
 enum SenderReceiver{
     Sender{
         sender: SenderWrapper,
-        state: Arc<State>,
+        state: State,
     },
     Receiver{
         receiver: ReceiverWrapper,
-        state: Arc<State>,
+        state: State,
     }
 }
 
 impl SenderReceiver{
-    fn set_state(&mut self, state: Arc<State>){
+    fn set_state(&mut self, state: State){
         match self{
             SenderReceiver::Sender{state: ref mut s, ..} => {
                 *s = state;
@@ -1265,37 +1266,37 @@ enum RequestType{
 }
 
 struct RequestManager {
-    requests: [Arc<Request>; MAX_REQUESTS as usize],
+    requests: [Request; MAX_REQUESTS as usize],
     //lock: Arc<Mutex<()>>,
-    index: Arc<AtomicU64>,
+    index: u64,
 }
 
 impl RequestManager {
-    fn new() -> Arc<Self> {
-        let requests: [Arc<Request>; MAX_REQUESTS as usize] = (0..MAX_REQUESTS)
-            .map(|_| Arc::new(Request::default()))
+    fn new() -> Self {
+        let requests: [Request; MAX_REQUESTS as usize] = (0..MAX_REQUESTS)
+            .map(|_| Request::default())
             .collect::<Vec<_>>()
             .try_into()
             .unwrap();
 
-        Arc::new(RequestManager {
+        RequestManager {
             requests,
             //lock: Arc::new(Mutex::new(())),
-            index: Arc::new(AtomicU64::new(0)),
-        })
+            index: 0,
+        }
     }
-    fn get_request(&self, idx: usize) -> Arc<Request> {
+    fn get_request(&mut self, idx: usize) -> &mut Request {
         let idx = idx & !(1 << 63);
-        self.requests[idx as usize].clone()
+        &mut self.requests[idx as usize]
     }
-    fn create_request(&self) -> (u64, u64, u64, Arc<Request>) {
+    fn create_request(&mut self) -> (u64, u64, u64, &mut Request) {
         //let _guard = self.lock.lock().unwrap(); // Ensure mutual exclusion
-        let current_index = self.index.load(Ordering::SeqCst);
+        let current_index = self.index;
         let metadata_index = (current_index | (1 << 63)) as u64;
         let heartbeat_index = (current_index | (1 << 62)) as u64;
-        let request = self.requests[current_index as usize].clone();
+        let request = &mut self.requests[current_index as usize];
         let next_index = (current_index + 1) % MAX_REQUESTS as u64;
-        self.index.store(next_index, Ordering::SeqCst);
+        self.index = next_index;
         (current_index as u64, metadata_index, heartbeat_index, request)
     }
 }
@@ -1468,7 +1469,7 @@ impl DataTracker {
 #[allow(dead_code)]
 struct TestRequest<'a>{
     qp_list: &'a RefCell<Vec<IbvQp>>,
-    request_manager: Arc<RequestManager>,
+    request_manager: &'a mut RequestManager,
     completion_tracker: Arc<CompletionTracker>,
     wrs_debug: Option<WrsDebug>,
     nccl_metadata: Option<NcclMetadata>,
@@ -1502,7 +1503,7 @@ struct State{
     id: u32,
     connection_id: u32,
     recv_send: SendRecv,
-    request_manager: Arc<RequestManager>,
+    request_manager: RequestManager,
     metadata_allocator: Arc<MetadataAllocator>,
     completion_tracker: Arc<CompletionTracker>,
     data_tracker: Arc<DataTracker>,
