@@ -319,7 +319,6 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
     state.debug = debug;
     state.qps = sender.qps().clone();
     state.in_buffer_ptr = sender.in_buffer_ptr();
-    state.qp_health_tracker = sender.qp_health_tracker().clone();
     let sender_handle = Box::into_raw(Box::new(SenderReceiver::Sender{
         sender: SenderWrapper::new(Box::new(sender)),
         state,
@@ -347,13 +346,10 @@ extern "C" fn plugin_accept(listen_comm: *mut c_void, recv_comm: *mut *mut c_voi
         new_state.recv_send = state.recv_send.clone();
         new_state.debug = state.debug;
         new_state.qps = receiver.qp_list().clone();
-        new_state.data_tracker = state.data_tracker.clone();
-        new_state.retry_tracker = state.retry_tracker.clone();
         new_state.in_buffer_ptr = receiver.in_buffer_ptr();
-        new_state.qp_health_tracker = receiver.qp_health_tracker().clone();
-        new_state.metadata_allocator = state.metadata_allocator.clone();
+        new_state.metadata_allocator = MetadataAllocator::new();
         new_state.request_manager = RequestManager::new();
-        new_state.completion_tracker = state.completion_tracker.clone();
+        new_state.completion_tracker = CompletionTracker::new();
         new_state.out_buffer_ptr = receiver.out_buffer_ptr();
         new_state.out_buffer_mr_addr = receiver.out_buffer_mr().addr();
         new_state.out_buffer_mr_lkey = receiver.out_buffer_mr().lkey();
@@ -440,7 +436,7 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
         return 0;
     }
     let (mut data_request_idx, _, _heartbeat_idx, request) = state.request_manager.create_request();
-    let completion_tracker = state.completion_tracker.clone();
+    let completion_tracker = &mut state.completion_tracker;
     request.set_idx(data_request_idx as u32);
     request.set_connection_id(state.connection_id);
     request.set_sizes(_size as u64);
@@ -518,7 +514,7 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
     let test_request = TestRequest{
         qp_list,
         request_manager: &mut state.request_manager,
-        completion_tracker: state.completion_tracker.clone(),
+        completion_tracker: &mut state.completion_tracker,
         wrs_debug: None,
         nccl_metadata: Some(in_nccl_metadata.clone()),
         request_idx: data_request_idx,
@@ -557,9 +553,9 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
     request.set_debug(state.debug);
     request.set_expected_completions(num_qps as u32);
 
-    let metadata_allocator = state.metadata_allocator.clone();
+    let metadata_allocator = &mut state.metadata_allocator;
     let start_position = metadata_allocator.allocate(n as usize);
-    let completion_tracker = state.completion_tracker.clone();
+    let completion_tracker = &mut state.completion_tracker;
     for i in 0..num_qps{
         let recv_wr = IbvRecvWr::new(None, Some(data_request_idx));
         if let Err(e) = qp_list.borrow_mut()[i].ibv_post_recv(recv_wr){
@@ -608,7 +604,7 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
     let test_request = TestRequest{
         qp_list,
         request_manager: &mut state.request_manager,
-        completion_tracker: state.completion_tracker.clone(),
+        completion_tracker: &mut state.completion_tracker,
         wrs_debug: None,
         nccl_metadata: None,
         request_idx: data_request_idx,
@@ -649,7 +645,7 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
         }
     }
     unsafe { * _done = 0; }
-    let completion_tracker = &boxed_test_request.completion_tracker;
+    let completion_tracker = &mut boxed_test_request.completion_tracker;
     let qp = &mut boxed_test_request.qp_list.borrow_mut()[0];
     let cq = qp.recv_cq().as_ptr();
     let mut wc_array: [MaybeUninit<ibv_wc>; MAX_COMPLETIONS];
@@ -1280,7 +1276,6 @@ enum RequestType{
 
 struct RequestManager {
     requests: [Request; MAX_REQUESTS as usize],
-    //lock: Arc<Mutex<()>>,
     index: u64,
 }
 
@@ -1294,7 +1289,6 @@ impl RequestManager {
 
         RequestManager {
             requests,
-            //lock: Arc::new(Mutex::new(())),
             index: 0,
         }
     }
@@ -1335,105 +1329,95 @@ impl RetryTracker{
 }
 
 struct CompletionTracker {
-    data_completion_bitmask: Arc<AtomicUsize>,       // Bitmask for data request completions
-    metadata_completion_bitmask: Arc<AtomicUsize>,   // Bitmask for metadata request completions
-    heartbeat_completion_bitmask: Arc<AtomicUsize>,  // Bitmask for heartbeat request completions
+    data_completion_bitmask: usize,       // Bitmask for data request completions
+    metadata_completion_bitmask: usize,   // Bitmask for metadata request completions
+    heartbeat_completion_bitmask: usize,  // Bitmask for heartbeat request completions
 }
 
 impl CompletionTracker {
     fn new() -> Self {
         CompletionTracker {
-            data_completion_bitmask: Arc::new(AtomicUsize::new(0)),
-            metadata_completion_bitmask: Arc::new(AtomicUsize::new(0)),
-            heartbeat_completion_bitmask: Arc::new(AtomicUsize::new(0)),
+            data_completion_bitmask: 0,
+            metadata_completion_bitmask: 0,
+            heartbeat_completion_bitmask: 0,
         }
     }
 
     /// Mark the request as complete by setting the corresponding bit in the appropriate bitmask
-    fn mark_complete(&self, request_id: u64) {
+    fn mark_complete(&mut self, request_id: u64) {
         let is_metadata = (request_id & (1 << 63)) != 0;   // Check if MSB is set
         let is_heartbeat = (request_id & (1 << 62)) != 0;  // Check if 2nd MSB is set
 
         if is_metadata {
             let index = (request_id & 0x3F) as usize;      // Bits 0-5
             let mask = 1 << index;
-            self.metadata_completion_bitmask.fetch_and(!mask, Ordering::SeqCst);
+            self.metadata_completion_bitmask &= !mask;
         } else if is_heartbeat {
             let index = (request_id & 0x3F) as usize;      // Bits 0-5
             let mask = 1 << index;
-            self.heartbeat_completion_bitmask.fetch_and(!mask, Ordering::SeqCst);
+            self.heartbeat_completion_bitmask &= !mask;
         } else {
             let qp_id = ((request_id >> 59) & 0x7) as usize;   // Bits 59-61
             let index = (request_id & 0x3F) as usize;          // Bits 0-5
 
             let bit_index = (qp_id << 6) | index;  // Combine qp_id and index
             let mask = 1 << bit_index;
-            self.data_completion_bitmask.fetch_and(!mask, Ordering::SeqCst);
+            self.data_completion_bitmask &= !mask;
         }
     }
 
     /// Mark the request as uncomplete by clearing the corresponding bit in the appropriate bitmask
-    fn mark_uncomplete(&self, request_id: u64) {
+    fn mark_uncomplete(&mut self, request_id: u64) {
         let is_metadata = (request_id & (1 << 63)) != 0;
         let is_heartbeat = (request_id & (1 << 62)) != 0;
 
         if is_metadata {
             let index = (request_id & 0x3F) as usize;
             let mask = 1 << index;
-            self.metadata_completion_bitmask.fetch_or(mask, Ordering::SeqCst);
+            self.metadata_completion_bitmask |= mask;
         } else if is_heartbeat {
             let index = (request_id & 0x3F) as usize;
             let mask = 1 << index;
-            self.heartbeat_completion_bitmask.fetch_or(mask, Ordering::SeqCst);
+            self.heartbeat_completion_bitmask |= mask;
         } else {
             let qp_id = ((request_id >> 59) & 0x7) as usize;
             let index = (request_id & 0x3F) as usize;
 
             let bit_index = (qp_id << 6) | index;
             let mask = 1 << bit_index;
-            self.data_completion_bitmask.fetch_or(mask, Ordering::SeqCst);
+            self.data_completion_bitmask |= mask;
         }
-    }
-    fn get_num_of_combined_uncompleted_requests(&self) -> usize {
-        self.data_completion_bitmask
-            .load(Ordering::SeqCst)
-            .count_ones() as usize
-            + self.metadata_completion_bitmask
-                .load(Ordering::SeqCst)
-                .count_ones() as usize
-            + self.heartbeat_completion_bitmask
-                .load(Ordering::SeqCst)
-                .count_ones() as usize
     }
 }
 
 
 struct MetadataAllocator {
-    tail: Arc<AtomicUsize>, // Atomic tail pointer for tracking the current allocation position
+    tail: usize, // Atomic tail pointer for tracking the current allocation position
 }
 
 impl MetadataAllocator {
     fn new() -> Self {
         MetadataAllocator {
-            tail: Arc::new(AtomicUsize::new(0)),
+            tail: 0,
         }
     }
 
     /// Allocates `n` consecutive metadata elements, even with wraparound.
     /// Always succeeds and returns the start index where the allocation began.
-    fn allocate(&self, n: usize) -> usize {
+    fn allocate(&mut self, n: usize) -> usize {
         assert!(n <= MAX_REQUESTS as usize, "Cannot allocate more than MAX_REQUESTS elements");
 
         // Fetch the current tail position
-        let start_index = self.tail.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current_tail| {
-            // Calculate the next tail position, wrapping around if necessary
-            Some((current_tail + n) % MAX_REQUESTS as usize)
-        }).unwrap();
+        let start_index = self.tail;
+
+        // Calculate the next tail position, wrapping around if necessary
+        self.tail = (self.tail + n) % MAX_REQUESTS as usize;
 
         start_index
     }
-    fn deallocate(&self, start_index: usize) {
-        self.tail.store(start_index, Ordering::SeqCst);
+
+    fn deallocate(&mut self, start_index: usize) {
+        self.tail = start_index;
     }
 }
 
@@ -1483,7 +1467,7 @@ impl DataTracker {
 struct TestRequest<'a>{
     qp_list: &'a RefCell<Vec<IbvQp>>,
     request_manager: &'a mut RequestManager,
-    completion_tracker: Arc<CompletionTracker>,
+    completion_tracker: &'a mut CompletionTracker,
     wrs_debug: Option<WrsDebug>,
     nccl_metadata: Option<NcclMetadata>,
     request_idx: u64,
@@ -1517,15 +1501,11 @@ struct State{
     connection_id: u32,
     recv_send: SendRecv,
     request_manager: RequestManager,
-    metadata_allocator: Arc<MetadataAllocator>,
-    completion_tracker: Arc<CompletionTracker>,
-    data_tracker: Arc<DataTracker>,
-    retry_tracker: Arc<RetryTracker>,
+    metadata_allocator: MetadataAllocator,
+    completion_tracker: CompletionTracker,
     debug: bool,
-    retries: u32,
     in_buffer_ptr: *mut c_void,
     qps: RefCell<Vec<IbvQp>>,
-    qp_health_tracker: Arc<AtomicU32>,
     out_buffer_ptr: *mut c_void,
     out_buffer_mr_addr: u64,
     out_buffer_mr_lkey: u32,
@@ -1534,7 +1514,6 @@ struct State{
     num_qps: usize,
     wrs: RefCell<[ibv_send_wr; MAX_WRS]>,
     sges: RefCell<[ibv_sge; MAX_WRS]>,
-    total_size: Arc<AtomicU64>,
 }
 impl State{
     fn new(num_qps: usize) -> Self{
@@ -1545,15 +1524,11 @@ impl State{
             connection_id: 0,
             recv_send: SendRecv::Send,
             request_manager: RequestManager::new(),
-            metadata_allocator: Arc::new(MetadataAllocator::new()),
-            completion_tracker: Arc::new(CompletionTracker::new()),
-            data_tracker: Arc::new(DataTracker::new()),
-            retry_tracker: Arc::new(RetryTracker::new()),
+            metadata_allocator: MetadataAllocator::new(),
+            completion_tracker: CompletionTracker::new(),
             debug: false,
-            retries: 0,
             in_buffer_ptr: null_mut(),
             qps: RefCell::new(Vec::new()),
-            qp_health_tracker: Arc::new(AtomicU32::new(0)),
             out_buffer_ptr: null_mut(),
             out_buffer_mr_addr: 0,
             out_buffer_mr_lkey: 0,
@@ -1562,7 +1537,6 @@ impl State{
             num_qps,
             wrs: RefCell::new(wrs),
             sges: RefCell::new(sges),
-            total_size: Arc::new(AtomicU64::new(0)),
         }
     }
 }
