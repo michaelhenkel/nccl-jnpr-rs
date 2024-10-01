@@ -459,7 +459,7 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
     let mut wr_idx = 0;
     for (qp_idx, qp) in qp_list.borrow_mut().iter_mut().enumerate() {
         unsafe { _mm_prefetch(qp as *const _ as *const i8, _MM_HINT_T0) };
-        request.expected_completions.fetch_add(1, Ordering::SeqCst);
+        request.expected_completions += 1;
         data_request_idx |= (qp_idx as u64 & 0x1F) << 57;
         completion_tracker.mark_uncomplete(data_request_idx);
         let mut last_wr_ptr: *mut ibv_send_wr = std::ptr::null_mut();
@@ -640,7 +640,7 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
         request_idx &= !(0x1F << 57);
         let request = boxed_test_request.request_manager.get_request(request_idx as usize);
         if request.get_completed() {
-            let size: u32 = request.sizes.load(Ordering::Acquire) as u32;
+            let size: u32 = request.sizes as u32;
             unsafe { *_size = size as i32; }
             unsafe { * _done = 1; }
             request.reset();
@@ -679,10 +679,11 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
             continue;
         }
         if wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM {
-            request.sizes.fetch_add(unsafe { wc.imm_data_invalidated_rkey_union.imm_data as u64 }, Ordering::Relaxed);
+            request.sizes += unsafe { wc.imm_data_invalidated_rkey_union.imm_data as u64 };
         }
-        let actual_completions = request.actual_completions.fetch_add(1, Ordering::Relaxed) + 1;
-        let expected_completions = request.expected_completions.load(Ordering::Acquire);
+        request.actual_completions += 1;
+        let actual_completions = request.actual_completions;
+        let expected_completions = request.expected_completions;
         if actual_completions == expected_completions {
             completion_tracker.mark_complete(wr_id);
             request.set_completed(true);
@@ -1127,108 +1128,120 @@ impl ReceiverWrapper{
 }
 
 struct Request{
-    connection_id: AtomicU32,
-    idx: AtomicU32,
-    sizes: AtomicU64,
-    id: AtomicU64,
-    completed: AtomicBool,
-    md_completed: AtomicBool,
-    md_idx: AtomicU32,
-    expected_completions: AtomicU32,
-    actual_completions: AtomicU32,
-    debug: AtomicBool,
-    retries: AtomicU32,
+    connection_id: u32,
+    idx: u32,
+    sizes: u64,
+    id: u64,
+    completed: bool,
+    md_completed: bool,
+    md_idx: u32,
+    expected_completions: u32,
+    actual_completions: u32,
+    debug: bool,
+    retries: u32,
 }
 
 impl Request{
-    fn new(idx: u32, conn_id: u32, size: u64, debug: bool, id: u64) -> Self{
-        Request{
-            connection_id: AtomicU32::new(conn_id),
-            idx: AtomicU32::new(idx),
-            sizes: AtomicU64::new(size),
-            id: AtomicU64::new(id),
-            completed: AtomicBool::new(false),
-            md_completed: AtomicBool::new(false),
-            md_idx: AtomicU32::new(0),
-            expected_completions: AtomicU32::new(0),
-            actual_completions: AtomicU32::new(0),
-            debug: AtomicBool::new(debug),
-            retries: AtomicU32::new(0),
+    fn new(idx: u32, conn_id: u32, size: u64, debug: bool, id: u64) -> Self {
+        Request {
+            connection_id: conn_id,
+            idx: idx,
+            sizes: size,
+            id: id,
+            completed: false,
+            md_completed: false,
+            md_idx: 0,
+            expected_completions: 0,
+            actual_completions: 0,
+            debug: debug,
+            retries: 0,
         }
     }
-    fn reset(&self){
-        self.connection_id.store(0, Ordering::SeqCst);
-        self.idx.store(0, Ordering::SeqCst);
-        self.sizes.store(0, Ordering::SeqCst);
-        self.id.store(0, Ordering::SeqCst);
-        self.completed.store(false, Ordering::SeqCst);
-        self.md_completed.store(false, Ordering::SeqCst);
-        self.md_idx.store(0, Ordering::SeqCst);
-        self.expected_completions.store(0, Ordering::SeqCst);
-        self.actual_completions.store(0, Ordering::SeqCst);
-        self.debug.store(false, Ordering::SeqCst);
-        self.retries.store(0, Ordering::SeqCst);
+    
+    fn reset(&mut self) {
+        self.connection_id = 0;
+        self.idx = 0;
+        self.sizes = 0;
+        self.id = 0;
+        self.completed = false;
+        self.md_completed = false;
+        self.md_idx = 0;
+        self.expected_completions = 0;
+        self.actual_completions = 0;
+        self.debug = false;
+        self.retries = 0;
     }
+    
     #[inline(always)]
-    fn set_idx(&self, idx: u32) {
-        self.idx.store(idx, Ordering::SeqCst);
+    fn set_idx(&mut self, idx: u32) {
+        self.idx = idx;
     }
+    
     #[inline(always)]
-    fn set_connection_id(&self, connection_id: u32) {
-        self.connection_id.store(connection_id, Ordering::SeqCst);
+    fn set_connection_id(&mut self, connection_id: u32) {
+        self.connection_id = connection_id;
     }
+    
     #[inline(always)]
-    fn set_sizes(&self, sizes: u64) {
-        self.sizes.store(sizes, Ordering::SeqCst);
+    fn set_sizes(&mut self, sizes: u64) {
+        self.sizes = sizes;
     }
+    
     #[inline(always)]
-    fn set_id(&self, id: u64) {
-        self.id.store(id, Ordering::SeqCst);
+    fn set_id(&mut self, id: u64) {
+        self.id = id;
     }
+    
     #[inline(always)]
-    fn set_completed(&self, completed: bool) {
-        self.completed.store(completed, Ordering::SeqCst);
+    fn set_completed(&mut self, completed: bool) {
+        self.completed = completed;
     }
+    
     #[inline(always)]
-    fn set_md_completed(&self, md_completed: bool) {
-        self.md_completed.store(md_completed, Ordering::SeqCst);
+    fn set_md_completed(&mut self, md_completed: bool) {
+        self.md_completed = md_completed;
     }
+    
     #[inline(always)]
-    fn set_expected_completions(&self, expected_completions: u32) {
-        self.expected_completions.store(expected_completions, Ordering::SeqCst);
+    fn set_expected_completions(&mut self, expected_completions: u32) {
+        self.expected_completions = expected_completions;
     }
+    
     #[inline(always)]
-    fn set_debug(&self, debug: bool) {
-        self.debug.store(debug, Ordering::SeqCst);
+    fn set_debug(&mut self, debug: bool) {
+        self.debug = debug;
     }
+    
     #[inline(always)]
     fn get_idx(&self) -> u32 {
-        self.idx.load(Ordering::SeqCst)
+        self.idx
     }
+    
     #[inline(always)]
     fn get_id(&self) -> u64 {
-        self.id.load(Ordering::SeqCst)
+        self.id
     }
+    
     #[inline(always)]
     fn get_completed(&self) -> bool {
-        self.completed.load(Ordering::SeqCst)
+        self.completed
     }
 }
 
 impl Default for Request{
     fn default() -> Self {
         Request{
-            connection_id: AtomicU32::new(0),
-            idx: AtomicU32::new(0),
-            sizes: AtomicU64::new(0),
-            id: AtomicU64::new(0),
-            completed: AtomicBool::new(false),
-            md_completed: AtomicBool::new(false),
-            md_idx: AtomicU32::new(0),
-            expected_completions: AtomicU32::new(0),
-            actual_completions: AtomicU32::new(0),
-            debug: AtomicBool::new(false),
-            retries: AtomicU32::new(0),
+            connection_id: 0,
+            idx: 0,
+            sizes: 0,
+            id: 0,
+            completed: false,
+            md_completed: false,
+            md_idx: 0,
+            expected_completions: 0,
+            actual_completions: 0,
+            debug: false,
+            retries: 0,
         }
     }
 }
@@ -1236,16 +1249,16 @@ impl Default for Request{
 impl Debug for Request{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Request {{ connection_id: {:?}, idx: {}, sizes: {}, id: {}, completed: {}, md_completed: {}, compl: {}, actual_compl: {}, debug: {}, retries: {} }}",
-            self.connection_id.load(Ordering::SeqCst),
-            self.idx.load(Ordering::SeqCst),
-            self.sizes.load(Ordering::SeqCst),
-            self.id.load(Ordering::SeqCst),
-            self.completed.load(Ordering::SeqCst),
-            self.md_completed.load(Ordering::SeqCst),
-            self.expected_completions.load(Ordering::SeqCst),
-            self.actual_completions.load(Ordering::SeqCst),
-            self.debug.load(Ordering::SeqCst),
-            self.retries.load(Ordering::SeqCst),
+            self.connection_id,
+            self.idx,
+            self.sizes,
+            self.id,
+            self.completed,
+            self.md_completed,
+            self.expected_completions,
+            self.actual_completions,
+            self.debug,
+            self.retries
         )
     }
 }
