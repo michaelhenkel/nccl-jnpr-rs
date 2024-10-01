@@ -437,11 +437,10 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
     }
     let (mut data_request_idx, _, _heartbeat_idx, request) = state.request_manager.create_request();
     let completion_tracker = &mut state.completion_tracker;
-    request.set_idx(data_request_idx as u32);
-    request.set_connection_id(state.connection_id);
-    request.set_sizes(_size as u64);
-    request.set_debug(state.debug);
-    request.set_id(in_nccl_metadata.context as u64);
+    request.idx = data_request_idx as u32;
+    request.connection_id = state.connection_id;
+    request.sizes = _size as u64;
+    request.id = in_nccl_metadata.context as u64;
     
     let mhandle_mr = unsafe { &mut *(_mhandle as *mut IbvMr) };
 
@@ -452,64 +451,41 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
     let qps = qp_list.borrow().len() as u64;
     let wrs = &mut state.wrs.borrow_mut();
     let sges = &mut state.sges.borrow_mut();
+    let lkey = mhandle_mr.lkey();
     let mut wr_idx = 0;
     for (qp_idx, qp) in qp_list.borrow_mut().iter_mut().enumerate() {
         unsafe { _mm_prefetch(qp as *const _ as *const i8, _MM_HINT_T0) };
         request.expected_completions += 1;
         data_request_idx |= (qp_idx as u64 & 0x1F) << 57;
         completion_tracker.mark_uncomplete(data_request_idx);
-        let mut last_wr_ptr: *mut ibv_send_wr = std::ptr::null_mut();
-        let mut first_wr_ptr: *mut ibv_send_wr = std::ptr::null_mut();
         let mut qp_remaining_volume = (_size as u64 + qps - 1 - qp_idx as u64) / qps;
         while qp_remaining_volume > 0 && remaining_volume > 0 {
             let wr = &mut wrs[wr_idx as usize];
             let sge = &mut sges[wr_idx as usize];
             let message = qp_remaining_volume.min(MAX_MESSAGE_SIZE);
-            let is_last_message_for_qp = qp_remaining_volume == message;
-            *sge = ibv_sge {
-                addr: data_addr,
-                length: message as u32,
-                lkey: mhandle_mr.lkey(),
-            };
-            *wr = ibv_send_wr {
-                wr_id: data_request_idx,
-                next: std::ptr::null_mut(),
-                sg_list: sge as *mut ibv_sge,
-                num_sge: 1,
-                opcode: if is_last_message_for_qp {
-                    ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM
-                } else {
-                    ibv_wr_opcode::IBV_WR_RDMA_WRITE
-                },
-                send_flags: if is_last_message_for_qp {
-                    ibv_send_flags::IBV_SEND_SIGNALED.0
-                } else {
-                    0
-                },
-                ..unsafe { std::mem::zeroed() } // Zero the rest if necessary
-            };
+            sge.addr = data_addr;
+            sge.length = message as u32;
+            sge.lkey = lkey;
+            wr.wr_id = data_request_idx;
+            wr.sg_list = sge as *mut ibv_sge;
+            wr.num_sge = 1;
+            wr.opcode = ibv_wr_opcode::IBV_WR_RDMA_WRITE;
+            wr.send_flags = 0;
             wr.wr.rdma.remote_addr = remote_addr;
             wr.wr.rdma.rkey = in_nccl_metadata.rkey;
-            if is_last_message_for_qp {
+            if qp_remaining_volume == message {
+                wr.opcode = ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM;
+                wr.send_flags = ibv_send_flags::IBV_SEND_SIGNALED.0;
                 wr.imm_data_invalidated_rkey_union.imm_data = message as u32;
             }
             let wr_ptr = wr as *mut ibv_send_wr;
-            if !last_wr_ptr.is_null() {
-                unsafe {
-                    (*last_wr_ptr).next = wr_ptr;
-                }
-            } else {
-                first_wr_ptr = wr_ptr;
-            }
-            last_wr_ptr = wr_ptr;
-
+            let _ = qp.ibv_post_send(wr_ptr);
             data_addr += message as u64;
             remote_addr += message as u64;
             remaining_volume -= message;
             qp_remaining_volume -= message;
             wr_idx += 1;
         }
-        let _ = qp.ibv_post_send(first_wr_ptr);
     }
     let test_request = TestRequest{
         qp_list,
@@ -522,8 +498,7 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
     };
 
     *in_nccl_metadata = NcclMetadata::default();
-    let test_request_box = Box::new(test_request);
-    let test_request_ptr = Box::into_raw(test_request_box) as *mut c_void;
+    let test_request_ptr = Box::into_raw(Box::new(test_request)) as *mut c_void;
     unsafe {
         *_request = test_request_ptr;
     }
