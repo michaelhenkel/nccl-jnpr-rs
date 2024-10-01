@@ -473,19 +473,27 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
             let wr = unsafe { &mut *wrs_ptr.add(wr_idx) };
             let sge = unsafe { &mut *sges_ptr.add(wr_idx) };
             let message = qp_remaining_volume.min(MAX_MESSAGE_SIZE);
+            let is_last_message = qp_remaining_volume == message;
             sge.addr = data_addr as u64;
             sge.length = message as u32;
             sge.lkey = lkey;
             wr.wr_id = data_request_idx;
             wr.sg_list = sge as *mut ibv_sge;
             wr.num_sge = 1;
-            wr.opcode = ibv_wr_opcode::IBV_WR_RDMA_WRITE;
-            wr.send_flags = 0;
+            wr.opcode = if is_last_message {
+                ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM
+            } else {
+                ibv_wr_opcode::IBV_WR_RDMA_WRITE
+            };
+            
+            wr.send_flags = if is_last_message {
+                ibv_send_flags::IBV_SEND_SIGNALED.0
+            } else {
+                0
+            };
             wr.wr.rdma.remote_addr = remote_addr as u64;
             wr.wr.rdma.rkey = in_nccl_metadata.rkey;
-            if qp_remaining_volume == message {
-                wr.opcode = ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM;
-                wr.send_flags = ibv_send_flags::IBV_SEND_SIGNALED.0;
+            if is_last_message {
                 wr.imm_data_invalidated_rkey_union.imm_data = message as u32;
             }
             let wr_ptr = wr as *mut ibv_send_wr;
@@ -505,14 +513,12 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
             wr_idx += 1;
         }
     }
+
     let test_request = TestRequest{
         qp_list,
         request_manager: &mut state.request_manager,
         completion_tracker: &mut state.completion_tracker,
-        wrs_debug: None,
-        nccl_metadata: Some(in_nccl_metadata.clone()),
         request_idx: data_request_idx,
-        data_tracker: None,
     };
 
     *in_nccl_metadata = NcclMetadata::default();
@@ -546,16 +552,14 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
     request.set_debug(state.debug);
     request.set_expected_completions(num_qps as u32);
 
-    let metadata_allocator = &mut state.metadata_allocator;
-    let start_position = metadata_allocator.allocate(n as usize);
-    let completion_tracker = &mut state.completion_tracker;
+    let start_position = state.metadata_allocator.allocate(n as usize);
     for i in 0..num_qps{
         let recv_wr = IbvRecvWr::new(None, Some(data_request_idx));
         if let Err(e) = qp_list[i].ibv_post_recv(recv_wr){
             println!("Error posting receive: {:?}", e);
             return 1;
         }
-        completion_tracker.mark_uncomplete(data_request_idx);
+        state.completion_tracker.mark_uncomplete(data_request_idx);
     }
     let out_nccl_metadata_list = state.out_buffer_ptr as *mut NcclMetadataList;
     let out_nccl_metadata_list: &mut NcclMetadataList = unsafe { &mut *out_nccl_metadata_list };
@@ -593,18 +597,14 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
         return 1;
     }
 
-    completion_tracker.mark_uncomplete(metadata_request_idx);
+    state.completion_tracker.mark_uncomplete(metadata_request_idx);
     let test_request = TestRequest{
         qp_list,
         request_manager: &mut state.request_manager,
         completion_tracker: &mut state.completion_tracker,
-        wrs_debug: None,
-        nccl_metadata: None,
         request_idx: data_request_idx,
-        data_tracker: None,
     };
-    let test_request_box = Box::new(test_request);
-    let test_request_ptr = Box::into_raw(test_request_box) as *mut c_void;
+    let test_request_ptr = Box::into_raw(Box::new(test_request)) as *mut c_void;
     unsafe {
         *_request = test_request_ptr;
     }
@@ -1459,10 +1459,7 @@ struct TestRequest<'a>{
     qp_list: &'a mut Vec<IbvQp>,
     request_manager: &'a mut RequestManager,
     completion_tracker: &'a mut CompletionTracker,
-    wrs_debug: Option<WrsDebug>,
-    nccl_metadata: Option<NcclMetadata>,
     request_idx: u64,
-    data_tracker: Option<Arc<DataTracker>>,
 }
 
 
