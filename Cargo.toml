@@ -25,6 +25,7 @@ serde = { version = "1.0.209", features = ["derive", "serde_derive"] }
 #ibverbs-rs = { git = "https://github.com/michaelhenkel/ibverbs-rs", branch = "v3" }
 ibverbs-rs = { path =  "../ibverbs-rs" }
 log = "0.4.22"
+array-init = "2.1.0"
 
 [build-dependencies]
 bindgen = "0.70.0"
