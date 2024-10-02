@@ -476,24 +476,22 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
     let mut data_addr = _data as *mut u8;
 
     let num_qps = state.num_qps as u64;
-    let wrs: &mut [ibv_send_wr; 4096] = &mut state.wrs;
-    let sges: &mut [ibv_sge; 4096] = &mut state.sges;
+    let wrs = &mut state.wrs;
+    let sges = &mut state.sges;
+    let wrs_ptr = wrs.as_mut_ptr();
+    let sges_ptr = sges.as_mut_ptr();
     let lkey = mhandle_mr.lkey();
     let mut wr_idx = 0;
     let qps_reciprocal = 1.0 / num_qps as f64;
     let adjusted_size = _size as u64 + num_qps - 1;
+    let now = std::time::Instant::now();
     for qp_idx in 0..num_qps{
-    //for (qp_idx, qp) in qp_list.iter_mut().enumerate() {
         let qp = &mut state.qps[qp_idx as usize];
         unsafe { _mm_prefetch(qp as *const _ as *const i8, _MM_HINT_T0) };
         request.expected_completions += 1;
         data_request_idx |= (qp_idx as u64 & 0x1F) << 57;
         state.completion_tracker.mark_uncomplete(data_request_idx);
         let mut qp_remaining_volume = ((adjusted_size - qp_idx as u64) as f64 * qps_reciprocal).floor() as u64;
-
-        //let mut qp_remaining_volume = (_size as u64 + qps - 1 - qp_idx as u64) / qps;
-        let wrs_ptr = wrs.as_mut_ptr();
-        let sges_ptr = sges.as_mut_ptr();
         while qp_remaining_volume > 0 && remaining_volume > 0 {
             let wr = unsafe { &mut *wrs_ptr.add(wr_idx) };
             let sge = unsafe { &mut *sges_ptr.add(wr_idx) };
@@ -534,16 +532,27 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
                     _mm_prefetch(sges_ptr.add(wr_idx + 1) as *const _ as *const i8, _MM_HINT_T0);
                 }
             }
-
             wr_idx += 1;
         }
     }
+    let elapsed = now.elapsed();
+    state.total_time += elapsed.as_nanos();
+    if state.runs % 100 == 0 {
+        let average = if state.total_time > 0 && state.runs > 0 {
+            state.total_time / state.runs as u128
+        } else {
+            0
+        };
+        println!("{} plugin_isend elapsed {:?} average {}", get_hostname(), elapsed, average);
+    }
+    state.runs += 1;
 
     let test_request = TestRequest{
         qp: &mut state.qps[0],
         request_manager: &mut state.request_manager,
         completion_tracker: &mut state.completion_tracker,
         request_idx: data_request_idx,
+        wc_array: &mut state.wc_array,
     };
 
     *in_nccl_metadata = NcclMetadata::default();
@@ -577,9 +586,23 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
     request.set_expected_completions(num_qps as u32);
 
     let start_position = state.metadata_allocator.allocate(n as usize);
+    let wrs = &mut state.recv_wrs;
+    let sges = &mut state.sges;
+    let wrs_ptr = wrs.as_mut_ptr();
+    let sges_ptr = sges.as_mut_ptr();
     for i in 0..num_qps{
-        let recv_wr = IbvRecvWr::new(None, Some(data_request_idx));
-        if let Err(e) = state.qps[i].ibv_post_recv(recv_wr){
+        let wr = unsafe { &mut *wrs_ptr.add(i) };
+        let sge = unsafe { &mut *sges_ptr.add(i) };
+        sge.addr = 0;
+        sge.length = 0;
+        sge.lkey = 0;
+        wr.sg_list = sge as *mut ibv_sge;
+        wr.wr_id = data_request_idx;
+        wr.num_sge = 1;
+        let wr_ptr = wr as *mut ibv_recv_wr;
+        let qp = &mut state.qps[i];
+        unsafe { _mm_prefetch(qp as *const _ as *const i8, _MM_HINT_T0) };
+        if let Err(e) = qp.ibv_post_recv(wr_ptr){
             println!("Error posting receive: {:?}", e);
             return 1;
         }
@@ -627,6 +650,7 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
         request_manager: &mut state.request_manager,
         completion_tracker: &mut state.completion_tracker,
         request_idx: data_request_idx,
+        wc_array: &mut state.wc_array,
     };
     let test_request_ptr = Box::into_raw(Box::new(test_request)) as *mut c_void;
     unsafe {
@@ -667,10 +691,7 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
     let completion_tracker = &mut boxed_test_request.completion_tracker;
     let qp = &mut boxed_test_request.qp;
     let cq = qp.recv_cq().as_ptr();
-    let mut wc_array: [MaybeUninit<ibv_wc>; MAX_COMPLETIONS];
-    unsafe {
-        wc_array = MaybeUninit::uninit().assume_init();
-    }
+    let wc_array = &mut boxed_test_request.wc_array;
     let wc_ptr = wc_array.as_mut_ptr() as *mut ibv_wc;
     let wc_done = unsafe { ibv_poll_cq(cq, MAX_COMPLETIONS as i32, wc_ptr) };
     let wc_slice = unsafe { std::slice::from_raw_parts(wc_ptr, wc_done as usize) };
@@ -1484,6 +1505,7 @@ struct TestRequest<'a>{
     request_manager: &'a mut RequestManager,
     completion_tracker: &'a mut CompletionTracker,
     request_idx: u64,
+    wc_array: &'a mut [MaybeUninit<ibv_wc>; MAX_COMPLETIONS],
 }
 
 
@@ -1523,14 +1545,19 @@ struct State{
     in_remote_buffer_addr: u64,
     in_remote_buffer_rkey: u32,
     num_qps: usize,
+    recv_wrs: [ibv_recv_wr; MAX_WRS],
     wrs: [ibv_send_wr; MAX_WRS],
     sges: [ibv_sge; MAX_WRS],
     qps: [IbvQp; MAX_QPS],
+    wc_array: [MaybeUninit<ibv_wc>; MAX_COMPLETIONS],
+    runs: u64,
+    total_time: u128,
 }
 impl State{
     fn new(num_qps: usize) -> Self{
         let wrs: [ibv_send_wr; MAX_WRS] = unsafe { std::mem::zeroed() };
         let sges: [ibv_sge; MAX_WRS] = unsafe { std::mem::zeroed() };
+        let recv_wrs: [ibv_recv_wr; MAX_WRS] = unsafe { std::mem::zeroed() };
         let qps: [IbvQp; MAX_QPS] = array_init::array_init(|i| {
             IbvQp::default()
         });
@@ -1549,9 +1576,13 @@ impl State{
             in_remote_buffer_addr: 0,
             in_remote_buffer_rkey: 0,
             num_qps,
+            recv_wrs,
             wrs,
             sges,
             qps,
+            wc_array: unsafe { MaybeUninit::uninit().assume_init() },
+            runs: 0,
+            total_time: 0,
         }
     }
 }
