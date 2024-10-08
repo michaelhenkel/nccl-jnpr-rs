@@ -26,6 +26,7 @@ serde = { version = "1.0.209", features = ["derive", "serde_derive"] }
 ibverbs-rs = { path =  "../ibverbs-rs" }
 log = "0.4.22"
 array-init = "2.1.0"
+crossbeam = { version = "0.8.4", features = ["crossbeam-channel"] }
 
 [build-dependencies]
 bindgen = "0.70.0"

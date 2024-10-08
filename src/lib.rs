@@ -134,6 +134,10 @@ extern "C" fn plugin_get_properties(_dev: c_int, props: *mut ncclNetProperties_v
 
 }
 extern "C" fn plugin_listen(_dev: c_int, handle: *mut c_void, listen_comm: *mut *mut c_void) -> ncclResult_t {
+    //println!("{} plugin_listen {} {} start", get_hostname(), conn_id, port);
+    let conn_id = rand::random::<u32>();
+    let port = portpicker::pick_unused_port().unwrap();
+    
     let filter = match std::env::var("JNPR_NCCL_DEV_FILTER"){
         Ok(filter) => {
             filter.split(",").map(|s| s.to_string()).collect::<Vec<String>>()
@@ -157,18 +161,21 @@ extern "C" fn plugin_listen(_dev: c_int, handle: *mut c_void, listen_comm: *mut 
             false
         }
     };
-    let port = portpicker::pick_unused_port().unwrap();
+
     let lookup_by = LookUpBy::Name(dev.to_string());
     let qp_mode = QpMode::Multi;
     // 200Gbps in kbps
-    let rate_limit = Some(100000000);
-    let mut receiver = match Receiver::new::<NcclMetadataList>(lookup_by, port, qp_mode, rate_limit, true){
+    let mut receiver = match Receiver::new::<NcclMetadataList>(lookup_by, port, qp_mode, None, true){
         Ok(receiver) => receiver,
         Err(e) => {
             log::error!("Error creating receiver: {:?}", e);
             return 1;
         }
     };
+    receiver.connection_id = conn_id;
+    let listen_address = receiver.listen_address();
+    //println!("{} plugin_listen {} {} start {}", get_hostname(), conn_id, port, listen_address);
+    
     if let Err(e) = receiver.create_control_buffer(){
         log::error!("Error creating metadata MR: {:?}", e);
         return 1;
@@ -193,6 +200,7 @@ extern "C" fn plugin_listen(_dev: c_int, handle: *mut c_void, listen_comm: *mut 
         }
     }
     netsock_handler.port = port;
+    netsock_handler.conn_id = conn_id;
 
     if !handle.is_null() {
         unsafe {
@@ -201,7 +209,7 @@ extern "C" fn plugin_listen(_dev: c_int, handle: *mut c_void, listen_comm: *mut 
         }
     }
     let mut state = State::new(num_qps);
-    state.id = rand::random::<u32>();
+    state.id = conn_id;
     state.connection_id = receiver.connection_id();
     state.recv_send = SendRecv::Recv;
     state.debug = debug;
@@ -214,9 +222,15 @@ extern "C" fn plugin_listen(_dev: c_int, handle: *mut c_void, listen_comm: *mut 
             *listen_comm = listen_comm_handle as *mut c_void;
         }
     }
+    //println!("{} plugin_listen {} {} end {}", get_hostname(), conn_id, port, listen_address);
     0
 }
 extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *mut c_void, _send_dev_comm: *mut *mut ncclNetDeviceHandle_v8_t) -> ncclResult_t {
+
+    let handle = handle as *mut NcclNetSocketHandle;
+    let conn_id = unsafe { (*handle).conn_id };
+    
+    let port = unsafe { (*handle).port };
     let filter = match std::env::var("JNPR_NCCL_DEV_FILTER"){
         Ok(filter) => {
             filter.split(",").map(|s| s.to_string()).collect::<Vec<String>>()
@@ -268,8 +282,6 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
             Family::Inet6
         }
     };
-    let handle = handle as *mut NcclNetSocketHandle;
-    let port = unsafe { (*handle).port };
     let receiver_family = unsafe { (*handle).family };
     let receiver_address = match receiver_family {
         4 => {
@@ -285,6 +297,7 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
             return 1;
         }
     };
+    
     let lookup_by = LookUpBy::Name(dev.to_string());
     let rate_limit = Some(100000000);
     let mut sender = match Sender::new::<NcclMetadataList>(
@@ -307,9 +320,13 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
         log::error!("Error creating metadata: {:?}", e);
         return 1;
     }
-    if let Err(e) = sender.connect(){
-        log::error!("Error connecting: {:?}", e);
-        return 1;
+
+    match sender.connect(){
+        Ok(()) => {},
+        Err(e) => {
+            log::error!("Error connecting: {:?}", e);
+            return 1;
+        }
     }
 
     let mut qps_vec = sender.qps().clone();
@@ -327,13 +344,14 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
     });
 
     let mut state = State::new(num_qps as usize);
-    state.id = rand::random::<u32>();
+    state.id = conn_id;
     state.connection_id = sender.connection_id();
     state.recv_send = SendRecv::Send;
     state.debug = debug;
     state.qps = qps;
     state.in_buffer_ptr = sender.in_buffer_ptr();
     state.num_qps = num_qps as usize;
+    //println!("{} plugin_connect {} {} end {:?}", get_hostname(), conn_id, port, receiver_address);
     let sender_handle = Box::into_raw(Box::new(SenderReceiver::Sender{
         sender: SenderWrapper::new(Box::new(sender)),
         state,
@@ -348,15 +366,20 @@ extern "C" fn plugin_accept(listen_comm: *mut c_void, recv_comm: *mut *mut c_voi
     let mut sender_receiver = unsafe { Box::from_raw(listen_comm as *mut SenderReceiver) };
     if let SenderReceiver::Receiver{ref mut receiver, ref mut state} = *sender_receiver{
         let receiver = receiver.receiver();
-
         let mut receiver = receiver.write().unwrap();
-        
-        if let Err(e) = receiver.accept(){
-            log::error!("Error accepting: {:?}", e);
-            return 1;
-        }
+        match receiver.accept(){
+            Ok(()) => { },
+            Err(_e) => {
+                unsafe {
+                    *recv_comm = null_mut();
+                }
+                Box::into_raw(sender_receiver);
+                return 0;
+            }
+        };
 
         let mut qps_vec = receiver.qp_list().clone();
+
         while qps_vec.len() < MAX_QPS {
             qps_vec.push(IbvQp::default());
         }
@@ -387,6 +410,8 @@ extern "C" fn plugin_accept(listen_comm: *mut c_void, recv_comm: *mut *mut c_voi
         new_state.in_remote_buffer_rkey = receiver.in_remote_buffer_rkey();
         new_state.num_qps = receiver.num_qps();
         sender_receiver.set_state(new_state);
+
+
         //state.qps = receiver.qp_list().clone();
 
         let receiver_handle = Box::into_raw(sender_receiver);
@@ -394,11 +419,11 @@ extern "C" fn plugin_accept(listen_comm: *mut c_void, recv_comm: *mut *mut c_voi
             *recv_comm = receiver_handle as *mut c_void;
         }
 
-
     } else {
         log::error!("Error accepting: {:?}", "Not a receiver");
         return 1;
     }
+
     0
 }
 extern "C" fn plugin_reg_mr(coll_comm: *mut c_void, data: *mut c_void, size: size_t, _type_: c_int, mhandle: *mut *mut c_void) -> ncclResult_t {
@@ -454,6 +479,7 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
         log::error!("Error accepting: {:?}", "Not a sender");
         return 1;
     };
+    //println!("{} plugin_isend {} start", get_hostname(), state.connection_id);
     let start_position = state.metadata_allocator.allocate(1);
     let in_nccl_metadata_list: *mut NcclMetadataList = state.in_buffer_ptr as *mut NcclMetadataList;
     let in_nccl_metadata_list: &mut NcclMetadataList = unsafe { &mut *in_nccl_metadata_list };
@@ -484,7 +510,7 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
     let mut wr_idx = 0;
     let qps_reciprocal = 1.0 / num_qps as f64;
     let adjusted_size = _size as u64 + num_qps - 1;
-    let now = std::time::Instant::now();
+    //let now = std::time::Instant::now();
     for qp_idx in 0..num_qps{
         let qp = &mut state.qps[qp_idx as usize];
         unsafe { _mm_prefetch(qp as *const _ as *const i8, _MM_HINT_T0) };
@@ -535,24 +561,13 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
             wr_idx += 1;
         }
     }
-    let elapsed = now.elapsed();
-    state.total_time += elapsed.as_nanos();
-    if state.runs % 100 == 0 {
-        let average = if state.total_time > 0 && state.runs > 0 {
-            state.total_time / state.runs as u128
-        } else {
-            0
-        };
-        println!("{} plugin_isend elapsed {:?} average {}", get_hostname(), elapsed, average);
-    }
-    state.runs += 1;
-
     let test_request = TestRequest{
         qp: &mut state.qps[0],
         request_manager: &mut state.request_manager,
         completion_tracker: &mut state.completion_tracker,
         request_idx: data_request_idx,
         wc_array: &mut state.wc_array,
+        connection_id: state.connection_id,
     };
 
     *in_nccl_metadata = NcclMetadata::default();
@@ -560,12 +575,14 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
     unsafe {
         *_request = test_request_ptr;
     }
+    //println!("{} plugin_isend {} end", get_hostname(), state.connection_id);
     0
 }
 
 const MAX_REQUESTS: u32 = 255;
 #[inline(always)]
 extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_void, _sizes: *mut c_int, _tags: *mut c_int, mhandles: *mut *mut c_void, _request: *mut *mut c_void) -> ncclResult_t { 
+    //std::thread::sleep(std::time::Duration::from_secs(10));
     let sender_receiver = unsafe { &mut *(recv_comm as *mut SenderReceiver) };
     let (_receiver, state) = if let SenderReceiver::Receiver{ref mut receiver, ref mut state} = *sender_receiver{
         (receiver, state)
@@ -573,6 +590,7 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
         log::error!("Error accepting: {:?}", "Not a receiver");
         return 1;
     };
+    //println!("{} plugin_irecv {} start", get_hostname(), state.connection_id);
     let num_qps = state.num_qps;
     let request_manager = &mut state.request_manager;
     let (mut data_request_idx, mut metadata_request_idx, _heartbeat_idx, request) = request_manager.create_request();
@@ -651,11 +669,13 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
         completion_tracker: &mut state.completion_tracker,
         request_idx: data_request_idx,
         wc_array: &mut state.wc_array,
+        connection_id: state.connection_id,
     };
     let test_request_ptr = Box::into_raw(Box::new(test_request)) as *mut c_void;
     unsafe {
         *_request = test_request_ptr;
     }
+    //println!("{} plugin_irecv {} end", get_hostname(), state.connection_id);
     0
 }
 extern "C" fn plugin_iflush(_recv_comm: *mut c_void, _n: c_int, _data: *mut *mut c_void, _sizes: *mut c_int, _mhandles: *mut *mut c_void, _request: *mut *mut c_void) -> ncclResult_t { 
@@ -671,7 +691,9 @@ const MAX_COMPLETIONS: usize = 64;
 
 #[inline(always)]
 extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *mut c_int) -> ncclResult_t {
+    
     let boxed_test_request = unsafe { &mut *(_request as *mut TestRequest) };
+    //println!("{} plugin_test {} start", get_hostname(), boxed_test_request.connection_id);
     {
         let mut request_idx = boxed_test_request.request_idx;
         request_idx &= !(0x1F << 57);
@@ -684,9 +706,11 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
             unsafe { * _done = 1; }
             request.reset();
             _request = null_mut();
+            //println!("{} plugin_test {} end request completed", get_hostname(), boxed_test_request.connection_id);
             return 0;
         }
     }
+
     unsafe { * _done = 0; }
     let completion_tracker = &mut boxed_test_request.completion_tracker;
     let qp = &mut boxed_test_request.qp;
@@ -721,6 +745,8 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
             completion_tracker.mark_complete(wr_id);
         }
     }
+    //std::thread::sleep(std::time::Duration::from_nanos(100));
+    //println!("{} plugin_test {} end request incomplete", get_hostname(), boxed_test_request.connection_id);
     0
 }
 extern "C" fn plugin_close_send(_send_comm: *mut c_void) -> ncclResult_t { 
@@ -1506,6 +1532,7 @@ struct TestRequest<'a>{
     completion_tracker: &'a mut CompletionTracker,
     request_idx: u64,
     wc_array: &'a mut [MaybeUninit<ibv_wc>; MAX_COMPLETIONS],
+    connection_id: u32,
 }
 
 
@@ -1516,6 +1543,7 @@ pub struct NcclNetSocketHandle {
     family: u8,
     port: u16,
     stage: u8,
+    conn_id: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
