@@ -330,6 +330,7 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
     }
 
     let mut qps_vec = sender.qps().clone();
+    let num_qps = qps_vec.len();
     while qps_vec.len() < MAX_QPS {
         qps_vec.push(IbvQp::default());
     }
@@ -350,7 +351,7 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
     state.debug = debug;
     state.qps = qps;
     state.in_buffer_ptr = sender.in_buffer_ptr();
-    state.num_qps = num_qps as usize;
+    state.num_qps = num_qps;
     //println!("{} plugin_connect {} {} end {:?}", get_hostname(), conn_id, port, receiver_address);
     let sender_handle = Box::into_raw(Box::new(SenderReceiver::Sender{
         sender: SenderWrapper::new(Box::new(sender)),
@@ -379,7 +380,7 @@ extern "C" fn plugin_accept(listen_comm: *mut c_void, recv_comm: *mut *mut c_voi
         };
 
         let mut qps_vec = receiver.qp_list().clone();
-
+        let num_qps = qps_vec.len();
         while qps_vec.len() < MAX_QPS {
             qps_vec.push(IbvQp::default());
         }
@@ -408,7 +409,7 @@ extern "C" fn plugin_accept(listen_comm: *mut c_void, recv_comm: *mut *mut c_voi
         new_state.out_buffer_mr_lkey = receiver.out_buffer_mr().lkey();
         new_state.in_remote_buffer_addr = receiver.in_remote_buffer_addr();
         new_state.in_remote_buffer_rkey = receiver.in_remote_buffer_rkey();
-        new_state.num_qps = receiver.num_qps();
+        new_state.num_qps = num_qps;
         sender_receiver.set_state(new_state);
 
 
