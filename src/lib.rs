@@ -511,7 +511,6 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
     let mut wr_idx = 0;
     let qps_reciprocal = 1.0 / num_qps as f64;
     let adjusted_size = _size as u64 + num_qps - 1;
-    //let now = std::time::Instant::now();
     for qp_idx in 0..num_qps{
         let qp = &mut state.qps[qp_idx as usize];
         unsafe { _mm_prefetch(qp as *const _ as *const i8, _MM_HINT_T0) };
@@ -530,22 +529,29 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
             wr.wr_id = data_request_idx;
             wr.sg_list = sge as *mut ibv_sge;
             wr.num_sge = 1;
-            wr.opcode = if is_last_message {
-                ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM
-            } else {
-                ibv_wr_opcode::IBV_WR_RDMA_WRITE
-            };
-            
-            wr.send_flags = if is_last_message {
-                ibv_send_flags::IBV_SEND_SIGNALED.0
-            } else {
-                0
-            };
+            wr.opcode = ibv_wr_opcode::IBV_WR_RDMA_WRITE;            
+            wr.send_flags = 0;
             wr.wr.rdma.remote_addr = remote_addr as u64;
             wr.wr.rdma.rkey = in_nccl_metadata.rkey;
+
             if is_last_message {
-                wr.imm_data_invalidated_rkey_union.imm_data = message as u32;
+                let last_wr = unsafe { &mut *wrs_ptr.add(wr_idx + 1) };
+                let last_sge = unsafe { &mut *sges_ptr.add(wr_idx + 1) };
+                last_sge.addr = 0;
+                last_sge.length = 0;
+                last_sge.lkey = 0;
+                last_wr.wr_id = data_request_idx;
+                last_wr.sg_list = last_sge as *mut ibv_sge;
+                last_wr.num_sge = 1;
+                last_wr.opcode = ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM;
+                last_wr.send_flags = ibv_send_flags::IBV_SEND_SIGNALED.0;
+                last_wr.wr.rdma.remote_addr = 0;
+                last_wr.wr.rdma.rkey = 0;
+                last_wr.imm_data_invalidated_rkey_union.imm_data = message as u32;
+                wr.next = last_wr as *mut ibv_send_wr;
+                wr_idx += 1;
             }
+
             let wr_ptr = wr as *mut ibv_send_wr;
             let _ = qp.ibv_post_send(wr_ptr);
             data_addr = unsafe { data_addr.add(message as usize) };
