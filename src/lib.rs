@@ -224,6 +224,7 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
     let handle = unsafe { &mut *handle };
     match handle.stage{
         ConnectionStages::Init => {
+            println!("{} plugin_connect {} Init", get_hostname(), handle.conn_id);
             let port = handle.port;
             let filter = match std::env::var("JNPR_NCCL_DEV_FILTER"){
                 Ok(filter) => {
@@ -399,6 +400,7 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
             }
         },
         ConnectionStages::SenderQpsConnected => {
+            println!("{} plugin_connect {} {} SenderQpsConnected", get_hostname(), handle.conn_id, handle.port);
             let sender = handle.sender.take().unwrap();
             let mut qps_vec = sender.qps().clone();
             let num_qps = qps_vec.len();
@@ -444,6 +446,10 @@ extern "C" fn plugin_accept(listen_comm: *mut c_void, recv_comm: *mut *mut c_voi
     if let SenderReceiver::Receiver{ref mut receiver, ref mut state} = *sender_receiver{
         match receiver.stage {
             ConnectionStages::Init => {
+                if !receiver.init{
+                    println!("{} plugin_accept {} Init", get_hostname(), state.connection_id);
+                    receiver.init = true;
+                }
                 match receiver.accept(){
                     Ok(accepted) => {
                         if accepted{
@@ -534,6 +540,7 @@ extern "C" fn plugin_accept(listen_comm: *mut c_void, recv_comm: *mut *mut c_voi
                 }
             },
             ConnectionStages::ReceiverQpsConnected => {
+                println!("{} plugin_accept {} ReceiverQpsConnected", get_hostname(), state.connection_id);
                 let mut qps_vec = receiver.qp_list.clone();
                 let num_qps = qps_vec.len();
                 while qps_vec.len() < MAX_QPS {
