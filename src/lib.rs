@@ -400,7 +400,6 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
         },
         ConnectionStages::SenderQpsConnected => {
             let sender = handle.sender.take().unwrap();
-            println!("{} {} plugin_connect end", get_hostname(), sender.connection_id);
             let mut qps_vec = sender.qps().clone();
             let num_qps = qps_vec.len();
             while qps_vec.len() < MAX_QPS {
@@ -666,27 +665,22 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
             wr.wr_id = data_request_idx;
             wr.sg_list = sge as *mut ibv_sge;
             wr.num_sge = 1;
-            wr.opcode = ibv_wr_opcode::IBV_WR_RDMA_WRITE;            
-            wr.send_flags = 0;
+            wr.opcode = if is_last_message {
+                ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM
+            } else {
+                ibv_wr_opcode::IBV_WR_RDMA_WRITE
+            };
+
+            wr.send_flags = if is_last_message {
+                ibv_send_flags::IBV_SEND_SIGNALED.0
+            } else {
+                0
+            };
             wr.wr.rdma.remote_addr = remote_addr as u64;
             wr.wr.rdma.rkey = in_nccl_metadata.rkey;
 
             if is_last_message {
-                let last_wr = unsafe { &mut *wrs_ptr.add(wr_idx + 1) };
-                let last_sge = unsafe { &mut *sges_ptr.add(wr_idx + 1) };
-                last_sge.addr = 0;
-                last_sge.length = 0;
-                last_sge.lkey = 0;
-                last_wr.wr_id = data_request_idx;
-                last_wr.sg_list = last_sge as *mut ibv_sge;
-                last_wr.num_sge = 1;
-                last_wr.opcode = ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM;
-                last_wr.send_flags = ibv_send_flags::IBV_SEND_SIGNALED.0;
-                last_wr.wr.rdma.remote_addr = 0;
-                last_wr.wr.rdma.rkey = 0;
-                last_wr.imm_data_invalidated_rkey_union.imm_data = message as u32;
-                wr.next = last_wr as *mut ibv_send_wr;
-                wr_idx += 1;
+                wr.imm_data_invalidated_rkey_union.imm_data = message as u32;
             }
 
             let wr_ptr = wr as *mut ibv_send_wr;
@@ -860,7 +854,6 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
     let wc_array = &mut boxed_test_request.wc_array;
     let wc_ptr = wc_array.as_mut_ptr() as *mut ibv_wc;
     let wc_done = unsafe { ibv_poll_cq(cq, MAX_COMPLETIONS as i32, wc_ptr) };
-    println!("{} {} plugin_test wc_done {:?}", get_hostname(), boxed_test_request.connection_id, wc_done);
     let wc_slice = unsafe { std::slice::from_raw_parts(wc_ptr, wc_done as usize) };
     for wc in wc_slice {
         if wc.status != ibv_wc_status::IBV_WC_SUCCESS {
@@ -879,7 +872,6 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
                 request.sizes += unsafe { wc.imm_data_invalidated_rkey_union.imm_data as u64 };
             }
             request.actual_completions += 1;
-            println!("{} {} plugin_test actual {} expected {}", get_hostname(), boxed_test_request.connection_id, request.actual_completions, request.expected_completions);
             if request.actual_completions == request.expected_completions {
                 completion_tracker.mark_complete(wr_id);
                 request.completed = true;
@@ -889,11 +881,6 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
             completion_tracker.mark_complete(wr_id);
         }
     }
-    if wc_done == 0 {
-        println!("{} {} plugin_test uncompleted {}", get_hostname(), boxed_test_request.connection_id, completion_tracker.uncompleted_requests());
-
-    }
-    std::thread::sleep(std::time::Duration::from_millis(2));
     0
 }
 extern "C" fn plugin_close_send(_send_comm: *mut c_void) -> ncclResult_t { 
