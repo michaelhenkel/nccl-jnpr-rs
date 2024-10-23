@@ -1,17 +1,15 @@
 use std::{
-    arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, ffi::{c_void, CStr, CString}, fmt::{Debug, Display}, fs, mem::MaybeUninit, net::{IpAddr, Ipv4Addr, Ipv6Addr}, os::raw::c_char, pin::Pin, ptr::null_mut, sync::{
-        Arc, Once, RwLock
-    }
+    arch::x86_64::{_mm_prefetch, _MM_HINT_T0}, ffi::{c_void, CStr, CString}, fmt::{Debug, Display}, fs, mem::MaybeUninit, net::{IpAddr, Ipv4Addr, Ipv6Addr}, os::raw::c_char, pin::Pin, ptr::null_mut, sync::Once
 };
 use ibverbs_rs::{
-    receiver::Receiver, sender::Sender, ConnectionStages, ControlBufferTrait, Family, Hints, IbvAccessFlags, IbvMr, IbvQp, IbvWrOpcode, LookUpBy, QpMode, SendRecv, SLOT_COUNT
+    receiver::Receiver, sender::Sender, ConnectionStages, ControlBufferTrait, Family, Hints, IbvAccessFlags, IbvMr, IbvQp, IbvWrOpcode, LookUpBy, QpMode, SendRecv
 };
 use rdma_sys::*;
 use env_logger::Env;
 mod bindings;
 use bindings::*;
 use serde::{Serialize, Deserialize};
-
+//use std::io::Write;
 
 static INIT: Once = Once::new();
 pub fn initialize_logger() {
@@ -70,6 +68,11 @@ macro_rules! abort {
 }
 
 extern "C" fn plugin_init(log_function: ncclDebugLogger_t) -> ncclResult_t {
+    /*
+    let pid = std::process::id();
+    let path = format!("/tmp/jnpr/{}.log", pid);
+    std::fs::File::create(path).unwrap();
+    */
     unsafe {
         LOG_FUNCTION = log_function;
     }
@@ -135,7 +138,12 @@ extern "C" fn plugin_get_properties(_dev: c_int, props: *mut ncclNetProperties_v
 extern "C" fn plugin_listen(_dev: c_int, handle: *mut c_void, listen_comm: *mut *mut c_void) -> ncclResult_t {
     let conn_id = rand::random::<u32>();
     let port = portpicker::pick_unused_port().unwrap();
-    
+    /*
+    let pid = std::process::id();
+    let path = format!("/tmp/jnpr/{}.log", pid);
+    let mut f = std::fs::File::options().append(true).open(path).unwrap();
+    write!(f, "{} {} {} Listen start\n", get_hostname(), pid, conn_id).unwrap();
+    */
     let filter = match std::env::var("JNPR_NCCL_DEV_FILTER"){
         Ok(filter) => {
             filter.split(",").map(|s| s.to_string()).collect::<Vec<String>>()
@@ -217,14 +225,20 @@ extern "C" fn plugin_listen(_dev: c_int, handle: *mut c_void, listen_comm: *mut 
             *listen_comm = listen_comm_handle as *mut c_void;
         }
     }
+    //write!(f, "{} {} {} Listen end\n", get_hostname(),pid, conn_id).unwrap();
     0
 }
 extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *mut c_void, _send_dev_comm: *mut *mut ncclNetDeviceHandle_v8_t) -> ncclResult_t {
+    /* 
+    let pid = std::process::id();
+    let path = format!("/tmp/jnpr/{}.log", pid);
+    let mut f = std::fs::File::options().append(true).open(path).unwrap();
+    */
     let handle = handle as *mut NcclNetSocketHandle;
     let handle = unsafe { &mut *handle };
     match handle.stage{
         ConnectionStages::Init => {
-            println!("{} plugin_connect {} Init", get_hostname(), handle.conn_id);
+            //write!(f, "{} {} {} SenderInit start\n", get_hostname(),pid, handle.conn_id).unwrap();
             let port = handle.port;
             let filter = match std::env::var("JNPR_NCCL_DEV_FILTER"){
                 Ok(filter) => {
@@ -314,17 +328,16 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
             handle.sender = Some(Box::new(sender));
             handle.stage = ConnectionStages::SenderInitialized;
             unsafe { *send_comm = null_mut() };
+            //write!(f, "{} {} {} SenderInit end\n", get_hostname(),pid, handle.conn_id).unwrap();
             return 0;
         },
         ConnectionStages::SenderInitialized => {
-            if handle.sender.as_mut().unwrap().connection_id == 0 {
-                println!("Error SenderInitialized Connection ID not set");
-                return 1;
-            }
+            //write!(f, "{} {} {} SenderInitialized start\n", get_hostname(), pid, handle.conn_id).unwrap();
             match handle.sender.as_mut().unwrap().connect(){
                 Ok(connected) => {
                     if connected {
                         handle.stage = ConnectionStages::SenderConnected;
+                        //write!(f, "{} {} {} SenderInitialized end\n", get_hostname(), pid, handle.conn_id).unwrap();
                     }
                     unsafe { *send_comm = null_mut() };
                     return 0;
@@ -336,10 +349,12 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
             }
         },
         ConnectionStages::SenderConnected => {
+            //write!(f, "{} {} {} SenderConnected start\n", get_hostname(), pid, handle.conn_id).unwrap();
             match handle.sender.as_mut().unwrap().send_control_buffer(){
                 Ok(control_buffer_sent) => {
                     if control_buffer_sent {
                         handle.stage = ConnectionStages::SenderControlBufferSent;
+                        //write!(f, "{} {} {} SenderConnected end\n", get_hostname(), pid, handle.conn_id).unwrap();
                     }
                     unsafe { *send_comm = null_mut() };
                     return 0;
@@ -351,10 +366,12 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
             }
         },
         ConnectionStages::SenderControlBufferSent => {
+            //write!(f, "{} {} {} SenderControlBufferSent start\n", get_hostname(), pid, handle.conn_id).unwrap();
             match handle.sender.as_mut().unwrap().receive_control_buffer_and_remote_chassis_id(){
                 Ok(control_buffer_received) => {
                     if control_buffer_received {
                         handle.stage = ConnectionStages::SenderControlBufferReceived;
+                        //write!(f, "{} {} {} SenderControlBufferSent end\n", get_hostname(), pid, handle.conn_id).unwrap();
                     }
                     unsafe { *send_comm = null_mut() };
                     return 0;
@@ -366,10 +383,12 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
             }
         },
         ConnectionStages::SenderControlBufferReceived => {
+            //write!(f, "{} {} {} SenderControlBufferReceived start\n", get_hostname(), pid, handle.conn_id).unwrap();
             match handle.sender.as_mut().unwrap().init_qps_and_send_qp_metadata(){
                 Ok(qps_init) => {
                     if qps_init {
                         handle.stage = ConnectionStages::SenderQpsInitialized;
+                        //write!(f, "{} {} {} SenderControlBufferReceived end\n", get_hostname(), pid, handle.conn_id).unwrap();
                     }
                     unsafe { *send_comm = null_mut() };
                     return 0;
@@ -381,14 +400,12 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
             }
         },
         ConnectionStages::SenderQpsInitialized => {
-            if handle.sender.as_mut().unwrap().connection_id == 0 {
-                println!("Error SenderQpsInitialized Connection ID not set");
-                return 1;
-            }
+            //write!(f, "{} {} {} SenderQpsInitialized start\n", get_hostname(), pid, handle.conn_id).unwrap();
             match handle.sender.as_mut().unwrap().receive_remote_qp_metadata_and_connect(){
                 Ok(qps_connected) => {
                     if qps_connected {
                         handle.stage = ConnectionStages::SenderQpsConnected;
+                        //write!(f, "{} {} {} SenderQpsInitialized end\n", get_hostname(), pid, handle.conn_id).unwrap();
                     }
                     unsafe { *send_comm = null_mut() };
                     return 0;
@@ -400,7 +417,7 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
             }
         },
         ConnectionStages::SenderQpsConnected => {
-            println!("{} plugin_connect {} {} SenderQpsConnected", get_hostname(), handle.conn_id, handle.port);
+            //write!(f, "{} {} {} SenderQpsInitialized start\n", get_hostname(), pid, handle.conn_id).unwrap();
             let sender = handle.sender.take().unwrap();
             let mut qps_vec = sender.qps().clone();
             let num_qps = qps_vec.len();
@@ -433,6 +450,7 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
             unsafe {
                 *send_comm = sender_handle as *mut c_void;
             }
+            //write!(f, "{} {} {} SenderQpsInitialized end\n", get_hostname(), pid, handle.conn_id).unwrap();
             return 0
         },
         _ => {
@@ -442,18 +460,21 @@ extern "C" fn plugin_connect(_dev: c_int, handle: *mut c_void, send_comm: *mut *
     }
 }
 extern "C" fn plugin_accept(listen_comm: *mut c_void, recv_comm: *mut *mut c_void, _recv_dev_comm: *mut *mut ncclNetDeviceHandle_v8_t) -> ncclResult_t {
+    /*
+    let pid = std::process::id();
+    let path = format!("/tmp/jnpr/{}.log", pid);
+    let mut f = std::fs::File::options().append(true).open(path).unwrap();
+    */
     let mut sender_receiver = unsafe { Box::from_raw(listen_comm as *mut SenderReceiver) };
     if let SenderReceiver::Receiver{ref mut receiver, ref mut state} = *sender_receiver{
         match receiver.stage {
             ConnectionStages::Init => {
-                if !receiver.init{
-                    println!("{} plugin_accept {} Init", get_hostname(), state.connection_id);
-                    receiver.init = true;
-                }
+                //write!(f, "{} {} {} ReceiverInit start\n", get_hostname(), pid, state.connection_id).unwrap();
                 match receiver.accept(){
                     Ok(accepted) => {
                         if accepted{
                             receiver.stage = ConnectionStages::ReceiverAccepted;
+                            //write!(f, "{} {} {} ReceiverInit end\n", get_hostname(), pid, state.connection_id).unwrap();
                         }
                         unsafe {
                             *recv_comm = null_mut();
@@ -468,10 +489,12 @@ extern "C" fn plugin_accept(listen_comm: *mut c_void, recv_comm: *mut *mut c_voi
                 };
             },
             ConnectionStages::ReceiverAccepted => {
+                //write!(f, "{} {} {} ReceiverAccepted start\n", get_hostname(), pid, state.connection_id).unwrap();
                 match receiver.receive_control_buffer(){
                     Ok(control_buffer_received) => {
                         if control_buffer_received {
                             receiver.stage = ConnectionStages::ReceiverControlBufferReceived;
+                            //write!(f, "{} {} {} ReceiverAccepted end\n", get_hostname(), pid, state.connection_id).unwrap();
                         }
                         unsafe {
                             *recv_comm = null_mut();
@@ -486,10 +509,12 @@ extern "C" fn plugin_accept(listen_comm: *mut c_void, recv_comm: *mut *mut c_voi
                 }
             },
             ConnectionStages::ReceiverControlBufferReceived => {
+                //write!(f, "{} {} {} ReceiverControlBufferReceived start\n", get_hostname(), pid, state.connection_id).unwrap();
                 match receiver.send_control_buffer_and_chassis_id(){
                     Ok(control_buffer_sent) => {
                         if control_buffer_sent {
                             receiver.stage = ConnectionStages::ReceiverControlBufferSent;
+                            //write!(f, "{} {} {} ReceiverControlBufferReceived end\n", get_hostname(), pid, state.connection_id).unwrap();
                         }
                         unsafe {
                             *recv_comm = null_mut();
@@ -504,10 +529,12 @@ extern "C" fn plugin_accept(listen_comm: *mut c_void, recv_comm: *mut *mut c_voi
                 }
             },
             ConnectionStages::ReceiverControlBufferSent => {
+                //write!(f, "{} {} {} ReceiverControlBufferSent start\n", get_hostname(), pid, state.connection_id).unwrap();
                 match receiver.receive_qp_metadata_and_init_qps(){
                     Ok(qps_connected) => {
                         if qps_connected {
                             receiver.stage = ConnectionStages::ReceiverQpsInitialized;
+                            //write!(f, "{} {} {} ReceiverControlBufferSent end\n", get_hostname(), pid, state.connection_id).unwrap();
                         }
                         unsafe {
                             *recv_comm = null_mut();
@@ -522,10 +549,12 @@ extern "C" fn plugin_accept(listen_comm: *mut c_void, recv_comm: *mut *mut c_voi
                 }
             },
             ConnectionStages::ReceiverQpsInitialized => {
+                //write!(f, "{} {} {} ReceiverQpsInitialized start\n", get_hostname(), pid, state.connection_id).unwrap();
                 match receiver.send_qp_metadata_and_connect_qps(){
                     Ok(qps_connected) => {
                         if qps_connected {
                             receiver.stage = ConnectionStages::ReceiverQpsConnected;
+                            //write!(f, "{} {} {} ReceiverQpsInitialized end\n", get_hostname(), pid, state.connection_id).unwrap();
                         }
                         unsafe {
                             *recv_comm = null_mut();
@@ -540,7 +569,7 @@ extern "C" fn plugin_accept(listen_comm: *mut c_void, recv_comm: *mut *mut c_voi
                 }
             },
             ConnectionStages::ReceiverQpsConnected => {
-                println!("{} plugin_accept {} ReceiverQpsConnected", get_hostname(), state.connection_id);
+                //write!(f, "{} {} {} ReceiverQpsConnected start\n", get_hostname(), pid, state.connection_id).unwrap();
                 let mut qps_vec = receiver.qp_list.clone();
                 let num_qps = qps_vec.len();
                 while qps_vec.len() < MAX_QPS {
@@ -572,6 +601,7 @@ extern "C" fn plugin_accept(listen_comm: *mut c_void, recv_comm: *mut *mut c_voi
                 new_state.in_remote_buffer_addr = receiver.in_remote_buffer_addr();
                 new_state.in_remote_buffer_rkey = receiver.in_remote_buffer_rkey();
                 new_state.num_qps = num_qps;
+                //write!(f, "{} {} {} ReceiverQpsConnected end\n", get_hostname(), pid, state.connection_id).unwrap();
                 sender_receiver.set_state(new_state);
                 let receiver_handle = Box::into_raw(sender_receiver);
                 unsafe {
@@ -590,6 +620,11 @@ extern "C" fn plugin_accept(listen_comm: *mut c_void, recv_comm: *mut *mut c_voi
     }
 }
 extern "C" fn plugin_reg_mr(coll_comm: *mut c_void, data: *mut c_void, size: size_t, _type_: c_int, mhandle: *mut *mut c_void) -> ncclResult_t {
+    /*
+    let pid = std::process::id();
+    let path = format!("/tmp/jnpr/{}.log", pid);
+    let mut f = std::fs::File::options().append(true).open(path).unwrap();
+    */
     let access_flags = IbvAccessFlags::LocalWrite.as_i32() | IbvAccessFlags::RemoteWrite.as_i32() | IbvAccessFlags::RemoteRead.as_i32();
     let mut sender_receiver = unsafe { Box::from_raw(coll_comm as *mut SenderReceiver) };
     let (pd, _sender_recv, _state) = match *sender_receiver{
@@ -600,9 +635,11 @@ extern "C" fn plugin_reg_mr(coll_comm: *mut c_void, data: *mut c_void, size: siz
             (receiver.pd(), "recv".to_string(), state)
         }
     };
+    //write!(f, "{} {} {} RegMr start\n", get_hostname(), pid, state.connection_id).unwrap();
     let mr = IbvMr::new(pd, data, size, access_flags);
     let mr_handle = Box::into_raw(Box::new(mr));
     unsafe { *mhandle = mr_handle as *mut c_void; }
+    //write!(f, "{} {} {} RegMr end\n", get_hostname(), pid, state.connection_id).unwrap();
     Box::into_raw(sender_receiver); 
     0
 }
@@ -633,14 +670,19 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
         unsafe { * _request = null_mut() };
         return 0;
     }
-    let (mut data_request_idx, _, request) = state.request_manager.create_request();
+    let (data_request_idx, _, request) = state.request_manager.create_request();
+    if !request.available{
+        println!("{} plugin_irecv error {:?}", get_hostname(), "Request not available");
+        state.metadata_allocator.deallocate(start_position);
+        unsafe { * _request = null_mut() };
+        return 0;
+    }
+    request.available = false;
     request.idx = data_request_idx as u32;
     request.connection_id = state.connection_id;
     request.sizes = _size as u64;
-    request.id = in_nccl_metadata.context as u64;
-    
+    request.id = in_nccl_metadata.context as u64;    
     let mhandle_mr = unsafe { &mut *(_mhandle as *mut IbvMr) };
-
     let mut remote_addr = in_nccl_metadata.address as *mut u8;
     let mut remaining_volume = _size as u64;
     let mut data_addr = _data as *mut u8;
@@ -652,51 +694,90 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
     let sges_ptr = sges.as_mut_ptr();
     let lkey = mhandle_mr.lkey();
     let mut wr_idx = 0;
-    let qps_reciprocal = 1.0 / num_qps as f64;
-    let adjusted_size = _size as u64 + num_qps - 1;
-    for qp_idx in 0..num_qps{
-        let qp = &mut state.qps[qp_idx as usize];
-        unsafe { _mm_prefetch(qp as *const _ as *const i8, _MM_HINT_T0) };
-        request.expected_completions += 1;
-        data_request_idx |= (qp_idx as u64 & 0x1F) << 57;
-        state.completion_tracker.mark_uncomplete(data_request_idx);
-        let mut qp_remaining_volume = ((adjusted_size - qp_idx as u64) as f64 * qps_reciprocal).floor() as u64;
-        while qp_remaining_volume > 0 && remaining_volume > 0 {
+
+    if _size >= num_qps as i32 {
+        let qps_reciprocal = 1.0 / num_qps as f64;
+        let adjusted_size = _size as u64 + num_qps - 1;
+        for qp_idx in 0..num_qps{
+            let qp = &mut state.qps[qp_idx as usize];
+            unsafe { _mm_prefetch(qp as *const _ as *const i8, _MM_HINT_T0) };
+            let mut qp_remaining_volume = ((adjusted_size - qp_idx as u64) as f64 * qps_reciprocal).floor() as u64;
+            while qp_remaining_volume > 0 && remaining_volume > 0 {
+                let wr = unsafe { &mut *wrs_ptr.add(wr_idx) };
+                let sge = unsafe { &mut *sges_ptr.add(wr_idx) };
+                let message = qp_remaining_volume.min(MAX_MESSAGE_SIZE);
+                let is_last_message = qp_remaining_volume == message;
+                sge.addr = data_addr as u64;
+                sge.length = message as u32;
+                sge.lkey = lkey;
+                wr.wr_id = data_request_idx;
+                wr.sg_list = sge as *mut ibv_sge;
+                wr.num_sge = 1;
+                wr.opcode = if is_last_message {
+                    ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM
+                } else {
+                    ibv_wr_opcode::IBV_WR_RDMA_WRITE
+                };
+
+                wr.send_flags = if is_last_message {
+                    ibv_send_flags::IBV_SEND_SIGNALED.0
+                } else {
+                    0
+                };
+                wr.wr.rdma.remote_addr = remote_addr as u64;
+                wr.wr.rdma.rkey = in_nccl_metadata.rkey;
+
+                if is_last_message {
+                    wr.imm_data_invalidated_rkey_union.imm_data = message as u32;
+                }
+
+                let wr_ptr = wr as *mut ibv_send_wr;
+                if let Err(e) = qp.ibv_post_send(wr_ptr){
+                    println!("{} plugin_isend error {:?} error posting send", get_hostname(), e);
+                    return 1;
+                }
+                request.expected_completions += 1;
+                state.completion_tracker.mark_uncomplete(data_request_idx);
+                state.total_data_posted += 1;
+                data_addr = unsafe { data_addr.add(message as usize) };
+                remote_addr = unsafe { remote_addr.add(message as usize) };
+                remaining_volume -= message;
+                qp_remaining_volume -= message;
+
+                if (wr_idx + 1) < wrs.len() {
+                    unsafe {
+                        _mm_prefetch(wrs_ptr.add(wr_idx + 1) as *const _ as *const i8, _MM_HINT_T0);
+                        _mm_prefetch(sges_ptr.add(wr_idx + 1) as *const _ as *const i8, _MM_HINT_T0);
+                    }
+                }
+                wr_idx += 1;
+            }
+        }
+    } else {
+        for qp_idx in 0..num_qps{
+            let qp = &mut state.qps[qp_idx as usize];
+            unsafe { _mm_prefetch(qp as *const _ as *const i8, _MM_HINT_T0) };
             let wr = unsafe { &mut *wrs_ptr.add(wr_idx) };
             let sge = unsafe { &mut *sges_ptr.add(wr_idx) };
-            let message = qp_remaining_volume.min(MAX_MESSAGE_SIZE);
-            let is_last_message = qp_remaining_volume == message;
             sge.addr = data_addr as u64;
-            sge.length = message as u32;
+            sge.length = 0;
             sge.lkey = lkey;
             wr.wr_id = data_request_idx;
             wr.sg_list = sge as *mut ibv_sge;
             wr.num_sge = 1;
-            wr.opcode = if is_last_message {
-                ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM
-            } else {
-                ibv_wr_opcode::IBV_WR_RDMA_WRITE
-            };
-
-            wr.send_flags = if is_last_message {
-                ibv_send_flags::IBV_SEND_SIGNALED.0
-            } else {
-                0
-            };
+            wr.opcode = ibv_wr_opcode::IBV_WR_RDMA_WRITE_WITH_IMM;
+            wr.send_flags = ibv_send_flags::IBV_SEND_SIGNALED.0;
             wr.wr.rdma.remote_addr = remote_addr as u64;
             wr.wr.rdma.rkey = in_nccl_metadata.rkey;
-
-            if is_last_message {
-                wr.imm_data_invalidated_rkey_union.imm_data = message as u32;
-            }
-
+            wr.imm_data_invalidated_rkey_union.imm_data = 0;
             let wr_ptr = wr as *mut ibv_send_wr;
-            let _ = qp.ibv_post_send(wr_ptr);
-            data_addr = unsafe { data_addr.add(message as usize) };
-            remote_addr = unsafe { remote_addr.add(message as usize) };
-            remaining_volume -= message;
-            qp_remaining_volume -= message;
-
+            if let Err(e) = qp.ibv_post_send(wr_ptr){
+                println!("{} plugin_isend error {:?} error posting send", get_hostname(), e);
+                return 1;
+            }
+            request.expected_completions += 1;
+            state.completion_tracker.mark_uncomplete(data_request_idx);
+            state.total_data_posted += 1;
             if (wr_idx + 1) < wrs.len() {
                 unsafe {
                     _mm_prefetch(wrs_ptr.add(wr_idx + 1) as *const _ as *const i8, _MM_HINT_T0);
@@ -705,6 +786,24 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
             }
             wr_idx += 1;
         }
+
+    }
+    if request.expected_completions == 0 {
+        println!("{} _size {} num_qps {}", get_hostname(), _size, num_qps);
+        let qps_reciprocal = 1.0 / num_qps as f64;
+        let adjusted_size = _size as u64 + num_qps - 1;
+        for qp_idx in 0..num_qps{
+            let mut qp_remaining_volume = ((adjusted_size - qp_idx as u64) as f64 * qps_reciprocal).floor() as u64;
+            while qp_remaining_volume > 0 && remaining_volume > 0 {
+                let message = qp_remaining_volume.min(MAX_MESSAGE_SIZE);
+                println!("{} size {} adjusted_size {} qp_idx {} num_qps {} qp_remaining_volume {} remaining_volume {} message_size {}", get_hostname(), _size, adjusted_size, qp_idx, num_qps, qp_remaining_volume, remaining_volume, message);
+                remaining_volume -= message;
+                qp_remaining_volume -= message;
+            }
+        }
+        println!("{} plugin_isend error {:?} {:#?}", get_hostname(), "No completions", request);
+        std::thread::sleep(std::time::Duration::from_secs(10));
+       
     }
     let test_request = TestRequest{
         qp: &mut state.qps[0],
@@ -713,6 +812,13 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
         request_idx: data_request_idx,
         wc_array: &mut state.wc_array,
         connection_id: state.connection_id,
+        send_recv: SendRecv::Send,
+        retries: 0,
+        num_qps: num_qps as u32,
+        total_data_posted: &mut state.total_data_posted,
+        total_data_completed: &mut state.total_data_completed,
+        total_md_posted: &mut state.total_md_posted,
+        total_md_completed: &mut state.total_md_completed,
     };
 
     *in_nccl_metadata = NcclMetadata::default();
@@ -724,10 +830,9 @@ extern "C" fn plugin_isend(send_comm: *mut c_void, _data: *mut c_void, _size: c_
     0
 }
 
-const MAX_REQUESTS: u32 = 255;
+const MAX_REQUESTS: u32 = 256;
 #[inline(always)]
 extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_void, _sizes: *mut c_int, _tags: *mut c_int, mhandles: *mut *mut c_void, _request: *mut *mut c_void) -> ncclResult_t { 
-    //std::thread::sleep(std::time::Duration::from_secs(10));
     let sender_receiver = unsafe { &mut *(recv_comm as *mut SenderReceiver) };
     let (_receiver, state) = if let SenderReceiver::Receiver{ref mut receiver, ref mut state} = *sender_receiver{
         (receiver, state)
@@ -743,21 +848,58 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
     let num_qps = state.num_qps;
     let request_manager = &mut state.request_manager;
     let (data_request_idx, metadata_request_idx, request) = request_manager.create_request();
+    if !request.available{
+        println!("{} plugin_irecv error {:?}", get_hostname(), "Request not available");
+        unsafe { * _request = null_mut() };
+        return 0;
+    }
     request.set_connection_id(state.connection_id);
     request.set_idx(data_request_idx as u32);
     let id = rand::random::<u32>();
     request.set_id(id as u64);
     request.set_debug(state.debug);
-    request.set_expected_completions(num_qps as u32);
+    request.available = false;
 
     let start_position = state.metadata_allocator.allocate(n as usize);
     let wrs = &mut state.recv_wrs;
     let sges = &mut state.sges;
     let wrs_ptr = wrs.as_mut_ptr();
     let sges_ptr = sges.as_mut_ptr();
-    for i in 0..num_qps{
-        let wr = unsafe { &mut *wrs_ptr.add(i) };
-        let sge = unsafe { &mut *sges_ptr.add(i) };
+
+
+    let mut total_size = 0;
+    for idx in 0..n {
+        let size = unsafe { * _sizes.offset(idx as isize) };
+        total_size += size;
+    }
+
+    //if total_size >= num_qps as i32 {
+        for i in 0..num_qps{
+            let wr = unsafe { &mut *wrs_ptr.add(i) };
+            let sge = unsafe { &mut *sges_ptr.add(i) };
+            sge.addr = 0;
+            sge.length = 0;
+            sge.lkey = 0;
+            wr.sg_list = sge as *mut ibv_sge;
+            wr.wr_id = data_request_idx;
+            wr.num_sge = 1;
+            let wr_ptr = wr as *mut ibv_recv_wr;
+            let qp = &mut state.qps[i];
+            unsafe { _mm_prefetch(qp as *const _ as *const i8, _MM_HINT_T0) };
+            if let Err(e) = qp.ibv_post_recv(wr_ptr){
+                println!("Error posting receive: {:?}", e);
+                return 1;
+            }
+            request.expected_completions += 1;
+            state.total_data_posted += 1;
+            state.completion_tracker.mark_uncomplete(data_request_idx);
+        }
+    /*
+    } else {
+        println!("{} total_size {} num_qps {}", get_hostname(), total_size, num_qps);
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        let wr = unsafe { &mut *wrs_ptr.add(0) };
+        let sge = unsafe { &mut *sges_ptr.add(0) };
         sge.addr = 0;
         sge.length = 0;
         sge.lkey = 0;
@@ -765,14 +907,18 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
         wr.wr_id = data_request_idx;
         wr.num_sge = 1;
         let wr_ptr = wr as *mut ibv_recv_wr;
-        let qp = &mut state.qps[i];
+        let qp = &mut state.qps[0];
         unsafe { _mm_prefetch(qp as *const _ as *const i8, _MM_HINT_T0) };
         if let Err(e) = qp.ibv_post_recv(wr_ptr){
             println!("Error posting receive: {:?}", e);
             return 1;
         }
+        request.expected_completions += 1;
+        state.total_data_posted += 1;
         state.completion_tracker.mark_uncomplete(data_request_idx);
     }
+    */
+
     let out_nccl_metadata_list = state.out_buffer_ptr as *mut NcclMetadataList;
     let out_nccl_metadata_list: &mut NcclMetadataList = unsafe { &mut *out_nccl_metadata_list };
     for idx in 0..n {
@@ -808,7 +954,7 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
         log::error!("Error posting send: {:?}", e);
         return 1;
     }
-
+    state.total_md_posted += 1;
     state.completion_tracker.mark_uncomplete(metadata_request_idx);
     let test_request = TestRequest{
         qp: &mut state.qps[0],
@@ -817,6 +963,13 @@ extern "C" fn plugin_irecv(recv_comm: *mut c_void, n: c_int, _data: *mut *mut c_
         request_idx: data_request_idx,
         wc_array: &mut state.wc_array,
         connection_id: state.connection_id,
+        send_recv: SendRecv::Recv,
+        retries: 0,
+        num_qps: num_qps as u32,
+        total_data_posted: &mut state.total_data_posted,
+        total_data_completed: &mut state.total_data_completed,
+        total_md_posted: &mut state.total_md_posted,
+        total_md_completed: &mut state.total_md_completed,
     };
     let test_request_ptr = Box::into_raw(Box::new(test_request)) as *mut c_void;
     unsafe {
@@ -831,18 +984,15 @@ extern "C" fn plugin_iflush(_recv_comm: *mut c_void, _n: c_int, _data: *mut *mut
 }
 
 const IBV_WC_RECV_RDMA_WITH_IMM: u32 = 129;
-const WR_ID_IGNORE_MASK: u64 = 1 << 62;
 const WR_ID_METADATA_MASK: u64 = 1 << 63;
-const REQUEST_IDX_MASK: u64 = 0x1F << 57;
-const MAX_COMPLETIONS: usize = 64;
+const MAX_COMPLETIONS: usize = 2048;
 
 #[inline(always)]
 extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *mut c_int) -> ncclResult_t {
     let boxed_test_request = unsafe { &mut *(_request as *mut TestRequest) };
     {
         let mut request_idx = boxed_test_request.request_idx;
-        request_idx &= !(0x1F << 57);
-        request_idx &= !(1 << 63);
+        request_idx &= !(WR_ID_METADATA_MASK);
         let request = &mut boxed_test_request.request_manager.requests[request_idx as usize];
         unsafe { _mm_prefetch(request as *const _ as *const i8, _MM_HINT_T0) };
         if request.completed {
@@ -854,6 +1004,7 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
             return 0;
         }
     }
+    boxed_test_request.retries += 1;
     unsafe { * _done = 0; }
     let completion_tracker = &mut boxed_test_request.completion_tracker;
     let qp = &mut boxed_test_request.qp;
@@ -867,26 +1018,52 @@ extern "C" fn plugin_test(mut _request: *mut c_void, _done: *mut c_int, _size: *
             return 1;
         }
         let wr_id = wc.wr_id;
-        if wr_id & WR_ID_IGNORE_MASK != 0 {
-            continue;
-        }
-        let mut request_idx = (wr_id & !REQUEST_IDX_MASK) as usize;
-        request_idx &= !(1 << 63);
+        //let mut request_idx = wr_id & !REQUEST_IDX_MASK;
+        let mut request_idx = wr_id;
+        request_idx &= !(WR_ID_METADATA_MASK);
         let request = &mut boxed_test_request.request_manager.requests[request_idx as usize];
+        if request.idx != request_idx as u32 {
+            println!("{} plugin_test error {:?}", get_hostname(), "Request index mismatch");
+            return 1;
+        }
         unsafe { _mm_prefetch(request as *const _ as *const i8, _MM_HINT_T0) };
+        match boxed_test_request.send_recv {
+            SendRecv::Send => {
+                if request_idx == 153 {
+                    //println!("{} request {:?}", get_hostname(), request);
+                }
+            },
+            SendRecv::Recv => {
+                if request_idx == 155 {
+                    //println!("{} request {:?}", get_hostname(), request);
+                }
+            }
+        }
+
         if (wr_id & WR_ID_METADATA_MASK) == 0 {
             if wc.opcode == IBV_WC_RECV_RDMA_WITH_IMM {
                 request.sizes += unsafe { wc.imm_data_invalidated_rkey_union.imm_data as u64 };
             }
             request.actual_completions += 1;
+            *boxed_test_request.total_data_completed += 1;
             if request.actual_completions == request.expected_completions {
                 completion_tracker.mark_complete(wr_id);
                 request.completed = true;
             }
         } else {
             request.md_completed = true;
+            *boxed_test_request.total_md_completed += 1;
             completion_tracker.mark_complete(wr_id);
         }
+    }
+    if boxed_test_request.retries > 10000 {
+        let mut request_id = boxed_test_request.request_idx;
+        request_id &= !(WR_ID_METADATA_MASK);
+        let request = &mut boxed_test_request.request_manager.requests[request_id as usize];
+        let req_idx = request.idx;
+        //println!("{} plugin_test send_recv {:?} req_id {} reg_idx {} size {} req_compl {} uncompleted {} num_qps {} exp {} act {} data posted {} data comp {} md posted {} md comp {} available {}", get_hostname(), boxed_test_request.send_recv, request_id, req_idx, request.sizes, request.completed, completion_tracker.uncompleted_requests(), boxed_test_request.num_qps, request.expected_completions, request.actual_completions, boxed_test_request.total_data_posted, boxed_test_request.total_data_completed, boxed_test_request.total_md_posted, boxed_test_request.total_md_completed, request.available);
+        //println!("{:#?}", request);
+        boxed_test_request.retries = 0;
     }
     0
 }
@@ -1131,7 +1308,7 @@ impl Display for CustomError{
 }
 
 #[derive(Clone, Debug)]
-pub struct NcclMetadataList(pub [NcclMetadata; SLOT_COUNT]);
+pub struct NcclMetadataList(pub [NcclMetadata; MAX_REQUESTS as usize]);
 
 impl From<IbvMr> for NcclMetadataList{
     fn from(mr: IbvMr) -> Self {
@@ -1188,11 +1365,11 @@ impl ControlBufferTrait for NcclMetadataList{
         std::mem::size_of::<Self>()
     }
     fn new() -> Pin<Box<dyn ControlBufferTrait>> where Self: Sized {
-        let mut nccl_metadata_list = Vec::with_capacity(SLOT_COUNT);
-        for _ in 0..SLOT_COUNT{
+        let mut nccl_metadata_list = Vec::with_capacity(MAX_REQUESTS as usize);
+        for _ in 0..MAX_REQUESTS{
             nccl_metadata_list.push(NcclMetadata::default());
         }
-        let nccl_metadata_list: [NcclMetadata; SLOT_COUNT] = nccl_metadata_list.try_into().unwrap();
+        let nccl_metadata_list: [NcclMetadata; MAX_REQUESTS as usize] = nccl_metadata_list.try_into().unwrap();
         let nccl_metadata_list = NcclMetadataList(nccl_metadata_list);
         Box::pin(nccl_metadata_list)
     }
@@ -1276,27 +1453,6 @@ impl SenderReceiver{
     }
 }
 
-struct SenderWrapper(Arc<RwLock<Box<Sender>>>);
-
-impl SenderWrapper{
-    fn new(sender: Box<Sender>) -> Self {
-        SenderWrapper(Arc::new(RwLock::new(sender)))
-    }
-    fn sender(&self) -> Arc<RwLock<Box<Sender>>> {
-        self.0.clone()
-    }
-}
-struct ReceiverWrapper(Arc<RwLock<Box<Receiver>>>);
-
-impl ReceiverWrapper{
-    fn new(receiver: Box<Receiver>) -> Self {
-        ReceiverWrapper(Arc::new(RwLock::new(receiver)))
-    }
-    fn receiver(&self) -> Arc<RwLock<Box<Receiver>>> {
-        self.0.clone()
-    }
-}
-
 struct Request{
     connection_id: u32,
     idx: u32,
@@ -1309,6 +1465,7 @@ struct Request{
     actual_completions: u32,
     debug: bool,
     retries: u32,
+    available: bool,
 }
 
 impl Request{
@@ -1324,6 +1481,7 @@ impl Request{
         self.actual_completions = 0;
         self.debug = false;
         self.retries = 0;
+        self.available = true;
     }
     
     #[inline(always)]
@@ -1376,13 +1534,14 @@ impl Default for Request{
             actual_completions: 0,
             debug: false,
             retries: 0,
+            available: true,
         }
     }
 }
 
 impl Debug for Request{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Request {{ connection_id: {:?}, idx: {}, sizes: {}, id: {}, completed: {}, md_completed: {}, compl: {}, actual_compl: {}, debug: {}, retries: {} }}",
+        write!(f, "Request {{ connection_id: {:?}, idx: {}, sizes: {}, id: {}, completed: {}, md_completed: {}, exp_compl: {}, actual_compl: {}, debug: {}, retries: {} , available: {} }}",
             self.connection_id,
             self.idx,
             self.sizes,
@@ -1392,7 +1551,8 @@ impl Debug for Request{
             self.expected_completions,
             self.actual_completions,
             self.debug,
-            self.retries
+            self.retries,
+            self.available
         )
     }
 }
@@ -1417,8 +1577,8 @@ impl RequestManager {
     }
     fn create_request(&mut self) -> (u64, u64, &mut Request) {
         let current_index = self.index;
-        let metadata_index = (current_index | (1 << 63)) as u64;
         let request = &mut self.requests[current_index as usize];
+        let metadata_index = (current_index | (1 << 63)) as u64;
         let next_index = (current_index + 1) % MAX_REQUESTS as u64;
         self.index = next_index;
         (current_index as u64, metadata_index, request)
@@ -1510,6 +1670,13 @@ struct TestRequest<'a>{
     request_idx: u64,
     wc_array: &'a mut [MaybeUninit<ibv_wc>; MAX_COMPLETIONS],
     connection_id: u32,
+    send_recv: SendRecv,
+    retries: u32,
+    num_qps: u32,
+    total_data_posted: &'a mut u128,
+    total_data_completed: &'a mut u128,
+    total_md_posted: &'a mut u128,
+    total_md_completed: &'a mut u128,
 }
 
 
@@ -1524,7 +1691,7 @@ pub struct NcclNetSocketHandle {
     sender: Option<Box<Sender>>,
 }
 impl NcclNetSocketHandle{
-    fn size(&self) -> usize {
+    fn _size(&self) -> usize {
         std::mem::size_of::<Self>()
     }
 }
@@ -1555,6 +1722,10 @@ struct State{
     out_buffer_mr_lkey: u32,
     in_remote_buffer_addr: u64,
     in_remote_buffer_rkey: u32,
+    total_data_posted: u128,
+    total_data_completed: u128,
+    total_md_posted: u128,
+    total_md_completed: u128,
     num_qps: usize,
     recv_wrs: [ibv_recv_wr; MAX_WRS],
     wrs: [ibv_send_wr; MAX_WRS],
@@ -1586,6 +1757,10 @@ impl State{
             out_buffer_mr_lkey: 0,
             in_remote_buffer_addr: 0,
             in_remote_buffer_rkey: 0,
+            total_data_posted: 0,
+            total_data_completed: 0,
+            total_md_posted: 0,
+            total_md_completed: 0,
             num_qps,
             recv_wrs,
             wrs,
